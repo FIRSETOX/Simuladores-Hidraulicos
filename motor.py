@@ -1,0 +1,1110 @@
+"""
+MOTOR DEL SIMULADOR HIDRÁULICO EN ESTADO ESTABLE (sin interfaz gráfica).
+
+Reproduce las fórmulas de la plantilla MLO-FR-05 "PLANTILLA SIMULADOR HIDRAULICO.xlsm":
+cálculo por tramo, resumen, interpolación, curva del sistema, Buscar objetivo,
+actualización de espesores, importación de plantillas y base de datos de sistemas.
+Lo usa la aplicación web (app.py) y se puede usar desde cualquier script de Python.
+"""
+import csv
+import getpass
+import io
+import json
+import math
+import os
+import re
+import sqlite3
+from dataclasses import dataclass, field, asdict, replace
+from datetime import datetime
+
+
+
+
+# --------------------------------------------------------------------------
+# Constantes (las mismas que usa la hoja de cálculo)
+# --------------------------------------------------------------------------
+PSI_POR_M_KGM3 = 0.00142245          # J = altura * densidad * 0.00142245
+KBD_A_M3S = 35000 / 220.5 / 24 / 3600  # B7 = B6*35000/220.5/24/3600
+KBD_A_BPH = 1000 / 24                # B8 = B6*1000/24
+BPH_A_KBD = 0.024                    # Resumen E15: inyección (bph) * 0.024
+IN_A_M = 0.0254
+IN_A_MM = 25.4
+FACTOR_DISENO = 0.72                 # MAOP = 0.72*2*SMYS*t/D
+RE_LAMINAR = 2200
+
+INYECCIONES = ("Sin inyección", "INY 1", "INY 2")
+
+# Tabla REF de la plantilla (Nombre, Densidad kg/m3, Visc cSt, T1 °F, Dens2, Visc2, T2)
+PRODUCTOS_DEFECTO = [
+    ["GM", 740, 0.6, 86, None, None, None],
+    ["B2E", 870, 4.6, 86, None, None, None],
+    ["JET", 821, 1.64, 86, None, None, None],
+    ["VO", 780, 1.2, 86, None, None, None],
+    ["KDHT", 820, 1.64, 86, None, None, None],
+    ["CRUDO CASTILLA NORTE", 957.095801578639, 722, 86, 950.696303347836, 358.8, 104],
+    ["MEZCLA APIAY", 952.685423160279, 650, 86, 906.308250949371, 450, 104],
+    ["Andalucia", 871.4, 7.88, 104, None, 6.19, 122],
+    ["Vasconia", 907.9, 22.02, 104, None, None, None],
+    ["Castilla", 980, 2297.88, 104, None, None, None],
+    ["Mezcla Castilla-Vasconia", 941.15, 174.67, 104, None, None, None],
+    ["Caño Limon", 876, 12.05, 104, None, None, None],
+    ["Nafta", 704, 0.504, 104, None, None, None],
+    ["GLP", 595, 0.27915966386554625, 85, None, None, None],
+    ["Floreña", 794, 1.72, 104, None, None, None],
+    ["Southblend", 877, 9.82, 104, None, None, None],
+    ["Combustoleo", 1020, 350, 86, None, None, None],
+    ["Agua", 1000, 1, 86, None, None, None],
+]
+
+
+# --------------------------------------------------------------------------
+# Estructuras de datos
+# --------------------------------------------------------------------------
+@dataclass
+class PuntoPerfil:
+    punto: str          # D  Punto/ubicación
+    km: float           # E  dist. del reg. [km]
+    altura: float       # F  altura [m]
+    espesor: float      # G  esp. [in]
+    diam_ext: float     # H  diám. ext. [in]
+    smys: float         # I  SMYS [psi]
+    rating: float = 0.0  # U  Rating de válvula [psi] (0 = usar MAOP por espesor)
+
+
+@dataclass
+class Tramo:
+    nombre: str
+    puntos: list = field(default_factory=list)   # list[PuntoPerfil]
+    rugosidad_in: float = 0.0018                 # B18
+    eficiencia: float = 100.0                    # B20
+
+
+@dataclass
+class Estacion:
+    nombre: str
+    presion_recibo: float = 0.0      # Resumen col C
+    paso_directo: bool = False       # True -> recibo = descarga del tramo siguiente (C17 = D17)
+    dr: float = 0.0                  # %DR del tramo que inicia en esta estación (fila 10)
+    fr: float = 1 / 1.1              # Factor de rotura (fila 11)
+    inyeccion: str = "Sin inyección"  # Resumen col J
+
+
+@dataclass
+class Proyecto:
+    sistema: str = ""
+    fecha: str = ""
+    responsable: str = ""
+    flujo_kbd: float = 86.4
+    producto: str = "GM"
+    densidad: float = 740.0
+    viscosidad: float = 0.6
+    iny1_bph: float = 0.0
+    iny2_bph: float = 0.0
+    estaciones: list = field(default_factory=list)  # n+1 estaciones
+    tramos: list = field(default_factory=list)      # n tramos
+    productos: list = field(default_factory=lambda: [list(p) for p in PRODUCTOS_DEFECTO])
+    km_interpolar: list = field(default_factory=lambda: [5, 20, 90, 100])
+
+    # ---------------- serialización ----------------
+    def to_dict(self):
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d):
+        p = Proyecto(**{k: v for k, v in d.items() if k not in ("estaciones", "tramos")})
+        p.estaciones = [Estacion(**e) for e in d.get("estaciones", [])]
+        p.tramos = []
+        for t in d.get("tramos", []):
+            tr = Tramo(nombre=t["nombre"], rugosidad_in=t.get("rugosidad_in", 0.0018),
+                       eficiencia=t.get("eficiencia", 100.0))
+            tr.puntos = [PuntoPerfil(**pp) for pp in t.get("puntos", [])]
+            p.tramos.append(tr)
+        return p
+
+
+# --------------------------------------------------------------------------
+# Resultados
+# --------------------------------------------------------------------------
+@dataclass
+class ResultadoTramo:
+    nombre: str
+    flujo_kbd: float
+    caudal_m3s: float
+    presion_recibo: float
+    dr: float
+    fr: float
+    J: list = field(default_factory=list)   # presión geodésica
+    K: list = field(default_factory=list)   # velocidad
+    L: list = field(default_factory=list)   # Reynolds
+    M: list = field(default_factory=list)   # pérdidas psi/km
+    N: list = field(default_factory=list)   # presión int + geod
+    O: list = field(default_factory=list)   # presión int
+    P: list = field(default_factory=list)   # MAOP
+    Q: list = field(default_factory=list)   # MAOP + geod
+    R: list = field(default_factory=list)   # descuelgue
+    S: list = field(default_factory=list)   # rotura de tubo
+    T: list = field(default_factory=list)   # lleno de línea acumulado (bls)
+
+    @property
+    def presion_descarga(self):
+        return self.O[0] if self.O else 0.0
+
+    @property
+    def roturas(self):
+        return sum(1 for s in self.S if s)
+
+    @property
+    def descuelgues(self):
+        return sum(1 for r in self.R if r)
+
+    @property
+    def lleno_kbls(self):
+        return (self.T[-1] if self.T else 0.0) / 1000
+
+    @property
+    def presion_remanente(self):
+        """Resumen col I: MIN de (N-J) positivos."""
+        pos = [o for o in self.O if o > 0]
+        return min(pos) if pos else None
+
+    @property
+    def re_min(self):
+        vals = [l for l in self.L if l > 0]
+        return min(vals) if vals else 0.0
+
+    @property
+    def regimen(self):
+        re_ = self.re_min
+        if re_ < RE_LAMINAR:
+            return "Laminar"
+        if re_ < 4500:
+            return "Transicional (revisar %DR)"
+        return "Turbulento"
+
+
+# --------------------------------------------------------------------------
+# Cálculo
+# --------------------------------------------------------------------------
+def factor_friccion_churchill(re, rug_mm, d_mm):
+    """Ecuación de Churchill tal como está en la columna M."""
+    a = (2.457 * math.log(1 / ((7 / re) ** 0.9 + 0.27 * rug_mm / d_mm))) ** 16
+    b = (37530 / re) ** 16
+    return 8 * ((8 / re) ** 12 + 1 / (a + b) ** 1.5) ** (1 / 12)
+
+
+def calcular_tramo(tramo: Tramo, flujo_kbd, densidad, visc_cst, dr, fr, presion_recibo):
+    n = len(tramo.puntos)
+    q_si = flujo_kbd * KBD_A_M3S
+    mu = visc_cst * densidad / 1e6
+    rug_mm = tramo.rugosidad_in * IN_A_MM
+    res = ResultadoTramo(tramo.nombre, flujo_kbd, q_si, presion_recibo, dr, fr)
+    if n == 0:
+        return res
+
+    J, K, L, M, P = [], [], [], [], []
+    for p in tramo.puntos:
+        d_in = p.diam_ext - 2 * p.espesor
+        d_m = d_in * IN_A_M
+        d_mm = d_in * IN_A_MM
+        j = p.altura * densidad * PSI_POR_M_KGM3
+        v = q_si / (0.25 * math.pi * d_m ** 2) if d_m > 0 else 0.0
+        re_ = densidad * v * d_m / mu if mu > 0 else 0.0
+        if re_ <= 0:
+            m = 0.0
+        else:
+            f = factor_friccion_churchill(re_, rug_mm, d_mm)
+            m = ((100 / tramo.eficiencia) * f * densidad * v ** 2 / d_m * 1000 / 100000 / 2) * 14.5
+            if re_ > RE_LAMINAR:
+                m *= (1 - dr / 100)
+        maop = p.rating if (p.rating or 0) > 0 else FACTOR_DISENO * 2 * p.smys * p.espesor / p.diam_ext
+        J.append(j); K.append(v); L.append(re_); M.append(m); P.append(maop)
+
+    # Presión int+geod: se calcula de aguas abajo hacia aguas arriba
+    N = [0.0] * n
+    N[-1] = J[-1] + presion_recibo
+    for i in range(n - 2, -1, -1):
+        e0, e1 = tramo.puntos[i].km, tramo.puntos[i + 1].km
+        if e0 == e1:
+            N[i] = N[i + 1]
+        else:
+            cand = N[i + 1] + (e1 - e0) * M[i]
+            N[i] = cand if cand > J[i] else J[i]
+
+    O = [N[i] - J[i] for i in range(n)]
+    Q = [J[i] + P[i] for i in range(n)]
+    R = [N[i] < J[i] for i in range(n)]
+    S = [P[i] < O[i] * fr for i in range(n)]
+
+    T = [0.0] * n
+    for i in range(1, n):
+        p = tramo.puntos[i]
+        d_m = (p.diam_ext - 2 * p.espesor) * IN_A_M
+        T[i] = (math.pi * d_m ** 2 / 4) * (p.km - tramo.puntos[i - 1].km) * 1e6 / 3.785 / 42 + T[i - 1]
+
+    res.J, res.K, res.L, res.M, res.N, res.O = J, K, L, M, N, O
+    res.P, res.Q, res.R, res.S, res.T = P, Q, R, S, T
+    return res
+
+
+def flujos_por_tramo(proy: Proyecto):
+    """Resumen col E: flujo acumulado con inyecciones (bph*0.024 = kbd)."""
+    flujos, prev = [], proy.flujo_kbd
+    for est in proy.estaciones[:len(proy.tramos)]:
+        f = prev
+        if est.inyeccion == "INY 2":
+            f = prev + proy.iny2_bph * BPH_A_KBD
+        elif est.inyeccion == "INY 1":
+            f = prev + proy.iny1_bph * BPH_A_KBD
+        flujos.append(f)
+        prev = f
+    return flujos
+
+
+def calcular_proyecto(proy: Proyecto, flujo_kbd=None):
+    """Calcula todos los tramos. Devuelve lista de ResultadoTramo (mismo orden que tramos)."""
+    if flujo_kbd is not None:
+        original = proy.flujo_kbd
+        proy.flujo_kbd = flujo_kbd
+        try:
+            flujos = flujos_por_tramo(proy)
+        finally:
+            proy.flujo_kbd = original
+    else:
+        flujos = flujos_por_tramo(proy)
+
+    n = len(proy.tramos)
+    resultados = [None] * n
+    # de aguas abajo hacia aguas arriba porque una estación "paso directo"
+    # recibe a la presión de descarga del tramo siguiente
+    for i in range(n - 1, -1, -1):
+        est_ini = proy.estaciones[i]
+        est_fin = proy.estaciones[i + 1]
+        if est_fin.paso_directo and i + 1 < n and resultados[i + 1] is not None:
+            p_rec = resultados[i + 1].presion_descarga
+        else:
+            p_rec = est_fin.presion_recibo
+        resultados[i] = calcular_tramo(proy.tramos[i], flujos[i], proy.densidad, proy.viscosidad,
+                                       est_ini.dr, est_ini.fr, p_rec)
+    return resultados
+
+
+def km_estaciones(proy: Proyecto):
+    """Resumen col B: ubicación de cada estación."""
+    kms = [0.0]
+    for t in proy.tramos:
+        kms.append(max((p.km for p in t.puntos), default=kms[-1]))
+    if proy.tramos and proy.tramos[0].puntos:
+        kms[0] = proy.tramos[0].puntos[0].km if proy.tramos[0].puntos[0].km else 0.0
+    return kms
+
+
+def interpolar_lista(proy: Proyecto, resultados, lista_km):
+    """Tabla 'Interpolación de puntos requeridos' de la hoja Resumen para muchos km a la vez
+    (búsqueda binaria: sirve para miles de puntos)."""
+    from bisect import bisect_right
+    kms = km_estaciones(proy)
+    if not resultados or not proy.tramos:
+        return [None for _ in lista_km]
+    perfiles = [[p.km for p in t.puntos] for t in proy.tramos]
+    alturas = [[p.altura for p in t.puntos] for t in proy.tramos]
+    inicios = kms[:len(proy.tramos)]
+    salida = []
+    for km in lista_km:
+        if km < kms[0] or km > kms[-1]:
+            salida.append(None)
+            continue
+        idx = max(0, bisect_right(inicios, km) - 1)
+        E = perfiles[idx]
+        if len(E) < 2:
+            salida.append(None)
+            continue
+        n = bisect_right(E, km) - 1                 # MATCH(km, E, 1)
+        n = min(max(n, 0), len(E) - 2)
+        while n > 0 and E[n + 1] == E[n]:
+            n -= 1
+        x0, x1 = E[n], E[n + 1]
+        r = resultados[idx]
+
+        def lin(arr):
+            if x1 == x0:
+                return arr[n]
+            return arr[n] + (arr[n + 1] - arr[n]) * (km - x0) / (x1 - x0)
+
+        salida.append({
+            "km": km, "dist_tramo": km - kms[idx], "altura": lin(alturas[idx]), "p_geod": lin(r.J),
+            "maop": lin(r.P), "p_int": lin(r.O), "maop_rem": lin(r.P) - lin(r.O), "p_int_geod": lin(r.N),
+            "velocidad": lin(r.K), "nre": lin(r.L), "tramo": proy.tramos[idx].nombre,
+            "inicio": proy.estaciones[idx].nombre, "fin": proy.estaciones[idx + 1].nombre,
+            "fila": n + 3})
+    return salida
+
+
+def interpolar(proy: Proyecto, resultados, km):
+    """Interpolación de un solo km (ver interpolar_lista)."""
+    return interpolar_lista(proy, resultados, [km])[0]
+
+
+def curva_sistema(proy: Proyecto, lim_inf, lim_sup, pasos=10, dr_forzado=None):
+    """Macro CurvaSistema: presión de descarga de cada estación para flujos entre límites.
+
+    dr_forzado: si no es None, se usa ese %DR en todos los tramos (p.ej. 0 = sin DRA).
+    """
+    originales = [e.dr for e in proy.estaciones]
+    try:
+        if dr_forzado is not None:
+            for e in proy.estaciones:
+                e.dr = dr_forzado
+        filas = []
+        for k in range(pasos + 1):
+            q = lim_inf + (lim_sup - lim_inf) * k / pasos
+            res = calcular_proyecto(proy, flujo_kbd=q)
+            filas.append((q, [r.presion_descarga for r in res]))
+        return filas
+    finally:
+        for e, dr in zip(proy.estaciones, originales):
+            e.dr = dr
+
+
+
+
+# --------------------------------------------------------------------------
+# BUSCAR OBJETIVO (igual que Datos > Análisis de hipótesis > Buscar objetivo)
+# --------------------------------------------------------------------------
+#  Celda a definir (salida):  ("descarga", i) ("roturas", i|None) ("descuelgues", i) ("remanente", i)
+#  Celda a cambiar (entrada): ("flujo", None) ("dr", i) ("recibo", j) ("iny1", None) ("iny2", None)
+ES_CONTEO = ("roturas", "descuelgues")
+LIMITES_VAR = {"flujo": (0.0, 1e5), "bph": (0.0, 1e5 * KBD_A_BPH), "dr": (-1000.0, 1000.0), "recibo": (0.0, 1e5),
+               "iny1": (-1e6, 1e6), "iny2": (-1e6, 1e6)}
+PASO_VAR = {"flujo": 1.0, "bph": 40.0, "dr": 2.0, "recibo": 5.0, "iny1": 50.0, "iny2": 50.0}
+
+
+def celdas_salida(proy: Proyecto):
+    est, n = proy.estaciones, len(proy.tramos)
+    out = [(f"Presión descarga – {est[i].nombre}", ("descarga", i)) for i in range(n)]
+    out += [(f"Rotura de tubo – {est[i].nombre}", ("roturas", i)) for i in range(n)]
+    out.append(("Rotura de tubo – TOTAL DEL SISTEMA", ("roturas", None)))
+    out += [(f"Descuelgue – {est[i].nombre}", ("descuelgues", i)) for i in range(n)]
+    out += [(f"Presión int remanente – {est[i].nombre}", ("remanente", i)) for i in range(n)]
+    return out
+
+
+def celdas_entrada(proy: Proyecto):
+    est, n = proy.estaciones, len(proy.tramos)
+    out = [("Flujo (KBDO)", ("flujo", None)), ("Flujo (bph) → ajusta el KBDO", ("bph", None))]
+    out += [(f"%DR – {est[i].nombre}", ("dr", i)) for i in range(n)]
+    out += [(f"Presión recibo – {est[j].nombre}", ("recibo", j)) for j in range(1, n + 1)
+            if not est[j].paso_directo]
+    out += [("INY 1 (bph)", ("iny1", None)), ("INY 2 (bph)", ("iny2", None))]
+    return out
+
+
+def leer_variable(proy: Proyecto, var):
+    t, i = var
+    return {"dr": lambda: proy.estaciones[i].dr, "flujo": lambda: proy.flujo_kbd,
+            "bph": lambda: proy.flujo_kbd * KBD_A_BPH,
+            "recibo": lambda: proy.estaciones[i].presion_recibo,
+            "iny1": lambda: proy.iny1_bph, "iny2": lambda: proy.iny2_bph}[t]()
+
+
+def fijar_variable(proy: Proyecto, var, valor):
+    t, i = var
+    if t == "dr":
+        proy.estaciones[i].dr = valor
+    elif t == "flujo":
+        proy.flujo_kbd = valor
+    elif t == "bph":
+        proy.flujo_kbd = valor / KBD_A_BPH
+    elif t == "recibo":
+        proy.estaciones[i].presion_recibo = valor
+    elif t == "iny1":
+        proy.iny1_bph = valor
+    elif t == "iny2":
+        proy.iny2_bph = valor
+
+
+def evaluar_celda(proy: Proyecto, celda, res=None):
+    t, i = celda
+    res = res if res is not None else calcular_proyecto(proy)
+    if t == "descarga":
+        return res[i].presion_descarga
+    if t == "remanente":
+        return res[i].presion_remanente or 0.0
+    sel = res if i is None else [res[i]]
+    if t == "roturas":
+        return sum(r.roturas for r in sel)
+    if t == "descuelgues":
+        return sum(r.descuelgues for r in sel)
+    raise ValueError(t)
+
+
+@dataclass
+class ResultadoBusqueda:
+    encontrado: bool
+    valor_variable: float
+    valor_obtenido: float
+    mensaje: str
+
+
+def _expandir(x0, cambia, paso, lo, hi, max_pasos=60):
+    """Avanza desde x0 hacia ambos lados (paso creciente) hasta que 'cambia(x)' sea True.
+    Devuelve (x_donde_cambia, x_anterior_del_mismo_lado) o (None, None)."""
+    h = paso
+    prev = {1: x0, -1: x0}
+    for _ in range(max_pasos):
+        for s in (1, -1):
+            x = min(max(x0 + s * h, lo), hi)
+            if x == prev[s]:
+                continue
+            if cambia(x):
+                return x, prev[s]
+            prev[s] = x
+        h *= 1.7
+    return None, None
+
+
+def buscar_objetivo(proy: Proyecto, celda, valor, variable, iteraciones=80) -> ResultadoBusqueda:
+    """Busca el valor de 'variable' con el que 'celda' toma 'valor'. No modifica el proyecto.
+
+    - Presiones: igual que Excel (la celda queda igual al valor).
+    - Rotura de tubo / Descuelgue (conteos): se busca el valor LÍMITE más cercano al actual
+      con el que el conteo es <= valor (p.ej. 0 roturas).
+    """
+    tipo = variable[0]
+    lo, hi = LIMITES_VAR[tipo]
+    x0 = leer_variable(proy, variable)
+    paso = max(abs(x0) * 0.02, PASO_VAR[tipo])
+    try:
+        if celda[0] in ES_CONTEO:
+            meta = int(round(valor))
+
+            def ok(x):
+                fijar_variable(proy, variable, x)
+                return evaluar_celda(proy, celda) <= meta
+
+            ok0 = ok(x0)
+            x_c, x_prev = _expandir(x0, lambda x: ok(x) != ok0, paso, lo, hi)
+            if x_c is None:
+                if ok0:
+                    return ResultadoBusqueda(True, x0, evaluar_celda(proy, celda),
+                                             "La condición se cumple para cualquier valor de la variable.")
+                return ResultadoBusqueda(False, x0, evaluar_celda(proy, celda),
+                                         "Ningún valor de la variable cumple la condición: "
+                                         "pruebe cambiando otra celda.")
+            a, b = (x_prev, x_c) if ok0 else (x_c, x_prev)   # a cumple, b no cumple
+            for _ in range(iteraciones):
+                m = (a + b) / 2
+                if ok(m):
+                    a = m
+                else:
+                    b = m
+            # se redondea a 4 decimales hacia el lado que cumple (valor "limpio" y seguro)
+            x = math.floor(a * 1e4) / 1e4 if b > a else math.ceil(a * 1e4) / 1e4
+            if not ok(x):
+                x = a
+            sentido = "máximo" if b > a else "mínimo"
+            msg = f"Valor {sentido} de la variable con el que se cumple la condición (límite)."
+        else:
+            def f(x):
+                fijar_variable(proy, variable, x)
+                return evaluar_celda(proy, celda) - valor
+
+            f0 = f(x0)
+            if abs(f0) < 1e-6:
+                x = x0
+            else:
+                x_c, x_prev = _expandir(x0, lambda x: (f(x) > 0) != (f0 > 0), paso, lo, hi)
+                if x_c is None:
+                    return ResultadoBusqueda(False, x0, f0 + valor,
+                                             "No se encontró una solución: el valor objetivo no se "
+                                             "alcanza cambiando esta celda.")
+                a, b, fa = x_prev, x_c, f(x_prev)
+                for _ in range(iteraciones):
+                    m = (a + b) / 2
+                    fm = f(m)
+                    if abs(fm) < 1e-7:
+                        a = b = m
+                        break
+                    if (fm > 0) == (fa > 0):
+                        a, fa = m, fm
+                    else:
+                        b = m
+                x = (a + b) / 2
+            msg = "Se ha encontrado una solución."
+        fijar_variable(proy, variable, x)
+        return ResultadoBusqueda(True, x, evaluar_celda(proy, celda), msg)
+    finally:
+        fijar_variable(proy, variable, x0)
+
+
+# --------------------------------------------------------------------------
+# ACTUALIZACIÓN DE ESPESORES (nuevas inspecciones)
+# --------------------------------------------------------------------------
+TOL_KM = 1e-9
+
+
+def _insertar_punto(tramo: Tramo, km):
+    pts = tramo.puntos
+    if any(abs(p.km - km) < TOL_KM for p in pts):
+        return
+    for i in range(len(pts) - 1):
+        a, b = pts[i], pts[i + 1]
+        if a.km < km < b.km:
+            t = (km - a.km) / (b.km - a.km)
+            pts.insert(i + 1, PuntoPerfil("", km, a.altura + (b.altura - a.altura) * t,
+                                          a.espesor, a.diam_ext, a.smys, 0.0))
+            return
+
+
+def actualizar_espesor_rango(tramo: Tramo, km_ini, km_fin, espesor):
+    """Asigna 'espesor' a la tubería entre km_ini y km_fin.
+
+    Si los límites no existen en el perfil se insertan puntos (altura interpolada) y se
+    duplican filas en los límites para representar el cambio de espesor en escalón,
+    igual que en la plantilla Excel. Devuelve [(km, espesor_anterior, espesor_nuevo)].
+    """
+    if km_fin < km_ini:
+        km_ini, km_fin = km_fin, km_ini
+    if not tramo.puntos or km_fin <= km_ini:
+        return []
+    km_ini = max(km_ini, tramo.puntos[0].km)
+    km_fin = min(km_fin, tramo.puntos[-1].km)
+    if km_fin <= km_ini:
+        return []
+    _insertar_punto(tramo, km_ini)
+    _insertar_punto(tramo, km_fin)
+    pts = tramo.puntos
+
+    def filas_en(km):
+        return [i for i, p in enumerate(pts) if abs(p.km - km) < TOL_KM]
+
+    ini = filas_en(km_ini)
+    if len(ini) == 1 and ini[0] > 0:                       # fila que "llega" con el espesor viejo
+        pts.insert(ini[0], replace(pts[ini[0]], punto="", rating=0.0))
+    fin = filas_en(km_fin)
+    if len(fin) == 1 and fin[0] < len(pts) - 1:            # fila que "sale" con el espesor viejo
+        pts.insert(fin[0] + 1, replace(pts[fin[0]], punto="", rating=0.0))
+    ini, fin = filas_en(km_ini), filas_en(km_fin)
+    cambios = []
+    for i, p in enumerate(pts):
+        dentro = (km_ini < p.km < km_fin) or (i == ini[-1]) or (i == fin[0])
+        if dentro and abs(p.espesor - espesor) > 1e-12:
+            cambios.append((p.km, p.espesor, espesor))
+            p.espesor = espesor
+    return cambios
+
+
+def leer_rangos_inspeccion(ruta):
+    """Lee un archivo CSV o Excel con columnas: km_desde, km_hasta, espesor_in [, nota]."""
+    filas = []
+    if isinstance(ruta, tuple):                      # (nombre, bytes) de un archivo subido a la web
+        nombre, contenido = ruta
+    else:
+        nombre = ruta
+        with open(ruta, "rb") as fh:
+            contenido = fh.read()
+    if nombre.lower().endswith((".xlsx", ".xlsm")):
+        import openpyxl
+        ws = openpyxl.load_workbook(io.BytesIO(contenido), data_only=True, read_only=True).worksheets[0]
+        crudas = [list(r) for r in ws.iter_rows(values_only=True)]
+    else:
+        texto = contenido.decode("utf-8-sig", errors="replace")
+        dialecto = csv.Sniffer().sniff(texto[:4096], delimiters=",;\t")
+        crudas = list(csv.reader(io.StringIO(texto), dialecto))
+    for r in crudas:
+        if not r or len(r) < 3:
+            continue
+        try:
+            a, b, e = (float(str(x).replace(",", ".")) for x in r[:3])
+        except (TypeError, ValueError):
+            continue          # encabezado o fila vacía
+        nota = str(r[3]) if len(r) > 3 and r[3] is not None else ""
+        filas.append((a, b, e, nota))
+    return filas
+
+# --------------------------------------------------------------------------
+# Importación desde la plantilla Excel
+# --------------------------------------------------------------------------
+def _num(v, defecto=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return defecto
+
+
+def _nombre_hyperlink(v):
+    if v is None:
+        return ""
+    s = str(v)
+    if s.startswith("="):
+        m = re.findall(r'"([^"]*)"', s)
+        return m[-1] if m else s
+    return s
+
+
+def _abrir_libro(ruta, **kw):
+    import openpyxl
+    if isinstance(ruta, (bytes, bytearray)):
+        return openpyxl.load_workbook(io.BytesIO(ruta), **kw)
+    return openpyxl.load_workbook(ruta, **kw)
+
+
+def _bloque(ws, max_fila, max_col):
+    """Lee un bloque de celdas de una hoja (modo rápido read_only) -> {(fila, col): valor}."""
+    d = {}
+    for r, fila in enumerate(ws.iter_rows(min_row=1, max_row=max_fila, max_col=max_col, values_only=True), 1):
+        for c, v in enumerate(fila, 1):
+            if v is not None:
+                d[(r, c)] = v
+    return d
+
+
+def _nombre_hoja(valor, hojas):
+    if valor in (None, ""):
+        return None
+    if isinstance(valor, float) and valor.is_integer():
+        valor = int(valor)
+    s = str(valor).strip()
+    if s in hojas:
+        return s
+    for h in hojas:                      # tolera espacios / mayúsculas distintas
+        if h.strip().lower() == s.lower():
+            return h
+    return None
+
+
+def importar_plantilla_excel(ruta, avance=None) -> Proyecto:
+    """Lee una plantilla del simulador (.xlsm/.xlsx).
+
+    ruta: ruta del archivo o su contenido en bytes. avance: función opcional avance(texto).
+    Usa el modo de lectura rápida de openpyxl (sirve para plantillas grandes).
+    Los avisos de la importación quedan en proy.avisos_importacion (lista de textos).
+    """
+    def aviso(t):
+        if avance:
+            avance(t)
+
+    aviso("Abriendo el libro…")
+    wb_v = _abrir_libro(ruta, data_only=True, read_only=True)     # valores calculados
+    wb_f = _abrir_libro(ruta, data_only=False, read_only=True)    # fórmulas (nombres / bypass)
+    hojas = wb_v.sheetnames
+    if "Resumen" not in hojas:
+        raise ValueError("El libro no tiene la hoja 'Resumen'.")
+    proy = Proyecto()
+    avisos = []
+
+    if "REF" in hojas:
+        prods = []
+        for fila in wb_v["REF"].iter_rows(min_row=2, max_col=8, values_only=True):
+            fila = list(fila) + [None] * (8 - len(fila))
+            if fila[0] in (None, "") or fila[2] is None:
+                continue
+            prods.append([str(fila[0])] + [fila[c] for c in (2, 3, 4, 5, 6, 7)])
+        if prods:
+            proy.productos = prods
+
+    aviso("Leyendo la hoja Resumen…")
+    rv = _bloque(wb_v["Resumen"], 40, 12)
+    rf = _bloque(wb_f["Resumen"], 40, 12)
+    proy.sistema = str(rv.get((2, 2), "") or "").strip()
+    proy.fecha = str(rv.get((3, 2), "") or "")
+    proy.responsable = str(rv.get((3, 6), "") or "")
+    proy.flujo_kbd = _num(rv.get((5, 3)), 0)
+    proy.iny1_bph = _num(rv.get((5, 6)), 0)
+    proy.iny2_bph = _num(rv.get((5, 9)), 0) or _num(rv.get((5, 8)), 0)
+    proy.producto = str(rv.get((7, 1), "GM") or "GM")
+    proy.densidad = _num(rv.get((6, 3)), 0)
+    proy.viscosidad = _num(rv.get((7, 3)), 0)
+    for p in proy.productos:
+        if p[0] == proy.producto:
+            proy.densidad = proy.densidad or _num(p[1])
+            proy.viscosidad = proy.viscosidad or _num(p[2])
+
+    # Estaciones (filas 15..35). La columna H dice la hoja del tramo (valor calculado).
+    filas_est = []
+    fila = 15
+    while fila <= 35 and rf.get((fila, 1)) not in (None, ""):
+        filas_est.append(fila)
+        fila += 1
+    usadas = set()
+    for k, fila in enumerate(filas_est):
+        idx = fila - 15
+        c_f = rf.get((fila, 3))
+        paso = isinstance(c_f, str) and c_f.replace("$", "").strip().upper() == "=D%d" % fila
+        est = Estacion(
+            nombre=_nombre_hyperlink(rf.get((fila, 1))) or str(rv.get((fila, 1), f"EST {k + 1}")),
+            presion_recibo=_num(rv.get((fila, 3)), 0),
+            paso_directo=paso,
+            dr=_num(rv.get((10, 2 + idx)), 0),
+            fr=_num(rv.get((11, 2 + idx)), 1 / 1.1),
+            inyeccion=str(rv.get((fila, 10), "Sin inyección") or "Sin inyección"),
+        )
+        if est.inyeccion not in INYECCIONES:
+            est.inyeccion = "Sin inyección"
+        proy.estaciones.append(est)
+        if k == len(filas_est) - 1:
+            break                                         # la última estación no inicia tramo
+        hoja = _nombre_hoja(rv.get((fila, 8)), hojas) or _nombre_hoja(rf.get((fila, 8)), hojas)
+        if hoja is None:
+            avisos.append(f"La estación {est.nombre} (fila {fila}) no tiene hoja de tramo válida en la columna H.")
+            break
+        if hoja in usadas:
+            avisos.append(f"La hoja '{hoja}' aparece repetida en la columna H (fila {fila}).")
+        usadas.add(hoja)
+        aviso(f"Leyendo el tramo '{hoja}'…")
+        proy.tramos.append(_leer_tramo(wb_v[hoja], hoja))
+    proy.estaciones = proy.estaciones[:len(proy.tramos) + 1]
+    for i in range(1, len(proy.tramos)):
+        a, b = proy.tramos[i - 1].puntos, proy.tramos[i].puntos
+        if a and b and abs(a[-1].km - b[0].km) > 0.5:
+            avisos.append(f"El tramo '{proy.tramos[i - 1].nombre}' termina en km {a[-1].km:.3f} y el siguiente "
+                          f"empieza en km {b[0].km:.3f}.")
+
+    # km de la tabla de interpolación (fila 66 en adelante, columna A)
+    km = []
+    for (v,) in wb_v["Resumen"].iter_rows(min_row=66, max_col=1, values_only=True):
+        if v is None:
+            break
+        if isinstance(v, (int, float)):
+            km.append(float(v))
+    if km:
+        proy.km_interpolar = km
+    proy.avisos_importacion = avisos
+    return proy
+
+
+def _leer_tramo(ws, nombre) -> Tramo:
+    par = _bloque(ws, 20, 2)
+    t = Tramo(nombre=nombre, rugosidad_in=_num(par.get((18, 2)), 0.0018),
+              eficiencia=_num(par.get((20, 2)), 100) or 100)
+    for row in ws.iter_rows(min_row=3, min_col=4, max_col=21, values_only=True):
+        row = list(row) + [None] * (18 - len(row))
+        d, e, f, g, h, i = row[0:6]
+        u = row[17]
+        if e is None or e == "":
+            break
+        if f is None or not isinstance(e, (int, float)):
+            continue
+        t.puntos.append(PuntoPerfil(str(d or ""), _num(e), _num(f), _num(g), _num(h), _num(i), _num(u, 0)))
+    return t
+
+
+# --------------------------------------------------------------------------
+# Perfil desde CSV
+# --------------------------------------------------------------------------
+COLUMNAS_CSV = ["punto", "km", "altura_m", "espesor_in", "diam_ext_in", "smys_psi", "rating_psi"]
+
+
+def leer_perfil_csv(ruta, nombre) -> Tramo:
+    with open(ruta, newline="", encoding="utf-8-sig") as fh:
+        muestra = fh.read(4096)
+        fh.seek(0)
+        dialecto = csv.Sniffer().sniff(muestra, delimiters=",;\t")
+        filas = list(csv.reader(fh, dialecto))
+    t = Tramo(nombre=nombre)
+    for fila in filas:
+        if not fila:
+            continue
+        try:
+            vals = [float(str(x).replace(",", ".")) if x.strip() else 0.0 for x in fila[1:7]]
+        except ValueError:
+            continue  # encabezado
+        while len(vals) < 6:
+            vals.append(0.0)
+        t.puntos.append(PuntoPerfil(fila[0], *vals))
+    return t
+
+
+def escribir_perfil_csv(tramo: Tramo, ruta):
+    with open(ruta, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh, delimiter=";")
+        w.writerow(COLUMNAS_CSV)
+        for p in tramo.puntos:
+            w.writerow([p.punto, p.km, p.altura, p.espesor, p.diam_ext, p.smys, p.rating])
+
+
+# ==========================================================================
+# BASE DE DATOS DE SISTEMAS (SQLite)
+# ==========================================================================
+def carpeta_programa():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:          # ejecutado desde una consola interactiva
+        return os.getcwd()
+
+
+# Se puede cambiar con la variable de entorno SIMULADOR_BD (p.ej. una carpeta del servidor)
+RUTA_BD = os.environ.get("SIMULADOR_BD", os.path.join(carpeta_programa(), "simuladores.db"))
+
+CAMPOS_PUNTO = [("punto", "Punto/ubicación"), ("km", "km"), ("altura", "Altura (m)"),
+                ("espesor", "Espesor (in)"), ("diam_ext", "Diámetro ext. (in)"),
+                ("smys", "SMYS (psi)"), ("rating", "Rating válvula (psi)")]
+
+
+def usuario_actual():
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001
+        return "usuario"
+
+
+class BaseDatos:
+    """sistemas: un registro por sistema con todos sus datos (JSON).
+    historial: trazabilidad de cambios (espesores, rating, operación…).
+    productos: tabla REF compartida por todos los sistemas."""
+
+    def __init__(self, ruta=RUTA_BD):
+        self.ruta = ruta
+        self.con = sqlite3.connect(ruta, check_same_thread=False, timeout=30)
+        self.con.execute("PRAGMA journal_mode=WAL")      # varios usuarios leyendo a la vez
+        c = self.con
+        c.execute("CREATE TABLE IF NOT EXISTS sistemas (nombre TEXT PRIMARY KEY, datos TEXT NOT NULL, "
+                  "actualizado TEXT, usuario TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS historial (id INTEGER PRIMARY KEY AUTOINCREMENT, sistema TEXT, "
+                  "fecha TEXT, usuario TEXT, tramo TEXT, km REAL, campo TEXT, anterior TEXT, nuevo TEXT, nota TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS productos (orden INTEGER, nombre TEXT PRIMARY KEY, densidad REAL, "
+                  "visc1 REAL, t1 REAL, dens2 REAL, visc2 REAL, t2 REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS config (clave TEXT PRIMARY KEY, valor TEXT)")
+        c.commit()
+        if not self.productos():
+            self.guardar_productos(PRODUCTOS_DEFECTO)
+
+    # ---------------- sistemas
+    def sistemas(self):
+        return [r[0] for r in self.con.execute("SELECT nombre FROM sistemas ORDER BY nombre COLLATE NOCASE")]
+
+    def existe(self, nombre):
+        return self.con.execute("SELECT 1 FROM sistemas WHERE nombre=?", (nombre,)).fetchone() is not None
+
+    def cargar(self, nombre) -> Proyecto:
+        fila = self.con.execute("SELECT datos FROM sistemas WHERE nombre=?", (nombre,)).fetchone()
+        if not fila:
+            raise KeyError(nombre)
+        p = Proyecto.from_dict(json.loads(fila[0]))
+        p.sistema = nombre
+        p.productos = self.productos()
+        return p
+
+    def info(self, nombre):
+        return self.con.execute("SELECT actualizado, usuario FROM sistemas WHERE nombre=?", (nombre,)).fetchone()
+
+    def guardar(self, proy: Proyecto, nota="", cambios_extra=None, usuario=None):
+        """Guarda el sistema y registra en el historial lo que cambió. Devuelve # de cambios."""
+        ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        usuario = usuario or usuario_actual()
+        if self.existe(proy.sistema):
+            cambios = diferencias(self.cargar(proy.sistema), proy)
+        else:
+            cambios = [("", None, "Sistema", "", "Creado en la base de datos")]
+        extra = [tuple(c) + ("",) * (6 - len(c)) for c in (cambios_extra or [])]
+        ya = {(c[0], c[1], c[2]) for c in extra}
+        cambios = [tuple(c) + (nota,) for c in cambios if (c[0], c[1], c[2]) not in ya]
+        cambios += [c[:5] + (c[5] or nota,) for c in extra]
+        datos = proy.to_dict()
+        datos.pop("productos", None)
+        self.con.execute("INSERT OR REPLACE INTO sistemas VALUES (?,?,?,?)",
+                         (proy.sistema, json.dumps(datos, ensure_ascii=False), ahora, usuario))
+        self.con.executemany(
+            "INSERT INTO historial (sistema, fecha, usuario, tramo, km, campo, anterior, nuevo, nota) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            [(proy.sistema, ahora, usuario, t, km, campo, str(a), str(n), nt) for t, km, campo, a, n, nt in cambios])
+        self.guardar_productos(proy.productos, commit=False)
+        self.con.commit()
+        return len(cambios)
+
+    def eliminar(self, nombre):
+        self.con.execute("DELETE FROM sistemas WHERE nombre=?", (nombre,))
+        self.con.commit()
+
+    def renombrar(self, viejo, nuevo):
+        self.con.execute("UPDATE sistemas SET nombre=? WHERE nombre=?", (nuevo, viejo))
+        self.con.execute("UPDATE historial SET sistema=? WHERE sistema=?", (nuevo, viejo))
+        self.con.commit()
+
+    def historial(self, nombre):
+        return self.con.execute("SELECT fecha, usuario, tramo, km, campo, anterior, nuevo, nota FROM historial "
+                                "WHERE sistema=? ORDER BY id DESC", (nombre,)).fetchall()
+
+    # ---------------- productos
+    def productos(self):
+        return [list(r) for r in self.con.execute(
+            "SELECT nombre, densidad, visc1, t1, dens2, visc2, t2 FROM productos ORDER BY orden")]
+
+    def guardar_productos(self, productos, commit=True):
+        self.con.execute("DELETE FROM productos")
+        self.con.executemany("INSERT OR REPLACE INTO productos VALUES (?,?,?,?,?,?,?,?)",
+                             [(k, *(list(p) + [None] * 7)[:7]) for k, p in enumerate(productos)])
+        if commit:
+            self.con.commit()
+
+    # ---------------- configuración
+    def config(self, clave, defecto=None):
+        r = self.con.execute("SELECT valor FROM config WHERE clave=?", (clave,)).fetchone()
+        return r[0] if r else defecto
+
+    def fijar_config(self, clave, valor):
+        self.con.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (clave, str(valor)))
+        self.con.commit()
+
+
+def _fmt_hist(v):
+    if isinstance(v, float):
+        return f"{v:.10g}"
+    return str(v)
+
+
+def diferencias(viejo: Proyecto, nuevo: Proyecto):
+    """Lista de cambios (tramo, km, campo, anterior, nuevo) entre dos versiones de un sistema."""
+    cambios = []
+    for campo, et in [("flujo_kbd", "Flujo (KBDO)"), ("producto", "Producto"), ("iny1_bph", "INY 1 (bph)"),
+                      ("iny2_bph", "INY 2 (bph)"), ("densidad", "Densidad"), ("viscosidad", "Viscosidad")]:
+        a, b = getattr(viejo, campo), getattr(nuevo, campo)
+        if a != b:
+            cambios.append(("", None, et, _fmt_hist(a), _fmt_hist(b)))
+    for eo, en in zip(viejo.estaciones, nuevo.estaciones):
+        for campo, et in [("nombre", "Nombre"), ("presion_recibo", "Presión recibo"), ("paso_directo", "Bypass"),
+                          ("dr", "%DR"), ("fr", "FR"), ("inyeccion", "Inyección")]:
+            a, b = getattr(eo, campo), getattr(en, campo)
+            if campo == "presion_recibo" and en.paso_directo:
+                continue
+            if a != b:
+                cambios.append((f"Estación {en.nombre}", None, et, _fmt_hist(a), _fmt_hist(b)))
+    if len(viejo.tramos) != len(nuevo.tramos):
+        cambios.append(("", None, "Número de tramos", len(viejo.tramos), len(nuevo.tramos)))
+    for to, tn in zip(viejo.tramos, nuevo.tramos):
+        if to.rugosidad_in != tn.rugosidad_in:
+            cambios.append((tn.nombre, None, "Rugosidad (in)", _fmt_hist(to.rugosidad_in), _fmt_hist(tn.rugosidad_in)))
+        if to.eficiencia != tn.eficiencia:
+            cambios.append((tn.nombre, None, "Eficiencia (%)", _fmt_hist(to.eficiencia), _fmt_hist(tn.eficiencia)))
+        if len(to.puntos) != len(tn.puntos):
+            cambios.append((tn.nombre, None, "Puntos del perfil", len(to.puntos), len(tn.puntos)))
+            continue
+        for po, pn in zip(to.puntos, tn.puntos):
+            for campo, et in CAMPOS_PUNTO:
+                a, b = getattr(po, campo), getattr(pn, campo)
+                if a != b:
+                    cambios.append((tn.nombre, pn.km, et, _fmt_hist(a), _fmt_hist(b)))
+    return cambios
+# ==========================================================================
+# Exportación a Excel
+# ==========================================================================
+def exportar_resultados_excel(proy, res, ruta, curva=None):
+    """ruta: nombre de archivo o io.BytesIO (descarga desde la web)."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    neg = Font(bold=True, color="FFFFFF")
+    azul = PatternFill("solid", fgColor="1F4E79")
+    rojo = PatternFill("solid", fgColor="FFC7CE")
+    amar = PatternFill("solid", fgColor="FFEB9C")
+
+    def encabezado(ws, fila, textos):
+        for j, t in enumerate(textos, 1):
+            c = ws.cell(fila, j, t)
+            c.font, c.fill = neg, azul
+            c.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+            ws.column_dimensions[get_column_letter(j)].width = max(12, min(30, len(t) + 2))
+
+    ws = wb.active
+    ws.title = "Resumen"
+    ws["A1"] = "SIMULADOR EN ESTADO ESTABLE PARA LA GENERACIÓN DE PERFILES HIDRÁULICOS PARA PRIORIZACIÓN ILI"
+    ws["A1"].font = Font(bold=True, size=12)
+    datos = [("Sistema:", proy.sistema), ("Fecha de elaboración:", proy.fecha),
+             ("Responsable elaboración:", proy.responsable), ("Flujo (KBDO):", proy.flujo_kbd),
+             ("Flujo (bph):", proy.flujo_kbd * KBD_A_BPH), ("Producto:", proy.producto),
+             ("Densidad (kg/m3):", proy.densidad), ("Viscosidad (cSt):", proy.viscosidad),
+             ("INY 1 (bph):", proy.iny1_bph), ("INY 2 (bph):", proy.iny2_bph)]
+    for i, (a, b) in enumerate(datos, 3):
+        ws.cell(i, 1, a).font = Font(bold=True)
+        ws.cell(i, 2, b)
+    f0 = 15
+    encabezado(ws, f0, ["Inicio Segmento", "Ubicación (km)", "Presión recibo (psig)", "Presión descarga (psig)",
+                        "Flujo (Kbdo)", "Rotura de tubo", "Lleno de línea (kbls)", "Tramo",
+                        "Presion Int remanente psig (Descuelgue)", "INYECCIÓN", "%DR", "FR",
+                        "Descuelgues", "Re mín", "Régimen"])
+    kms = km_estaciones(proy)
+    for i, e in enumerate(proy.estaciones):
+        r = res[i] if i < len(res) else None
+        prec = res[i - 1].presion_recibo if 0 < i <= len(res) else None
+        fila = [e.nombre, kms[i], prec]
+        if r:
+            fila += [r.presion_descarga, r.flujo_kbd, r.roturas, r.lleno_kbls, r.nombre,
+                     r.presion_remanente, e.inyeccion, e.dr, e.fr, r.descuelgues, r.re_min, r.regimen]
+        for j, v in enumerate(fila, 1):
+            ws.cell(f0 + 1 + i, j, v)
+    ft = f0 + 2 + len(proy.estaciones)
+    ws.cell(ft, 1, "Total (km)").font = Font(bold=True)
+    ws.cell(ft, 2, kms[-1])
+    ws.cell(ft, 6, "Line fill").font = Font(bold=True)
+    ws.cell(ft, 7, sum(r.lleno_kbls for r in res))
+
+    # Interpolación
+    fi = ft + 3
+    ws.cell(fi - 1, 1, "Interpolación de puntos requeridos").font = Font(bold=True)
+    encabezado(ws, fi, ["dist.del reg. [km]", "dist. tramo [km]", "altura [m]", "Presión geodésica (psig)",
+                        "MAOP (psig)", "Presión int (psig)", "MAOP remanente (psig)", "Presión int+geod (psig)",
+                        "Velocidad [m/s]", "Nre", "Tramo", "Inicio tramo", "Fin tramo", "# Fila"])
+    for k, (km, d) in enumerate(zip(proy.km_interpolar, interpolar_lista(proy, res, proy.km_interpolar)), 1):
+        if d is None:
+            ws.cell(fi + k, 1, km)
+            ws.cell(fi + k, 2, "Fuera de rango")
+            continue
+        for j, key in enumerate(["km", "dist_tramo", "altura", "p_geod", "maop", "p_int", "maop_rem",
+                                 "p_int_geod", "velocidad", "nre", "tramo", "inicio", "fin", "fila"], 1):
+            ws.cell(fi + k, j, d[key])
+
+    # Hojas de tramo
+    cab = ["Punto/ubicación", "dist.del reg. [km]", "altura [m]", "esp. [in]", "diám. ext. [in]", "SMYS [PSI]",
+           "Presión geodésica (psig)", "Velocidad [m/s]", "Nre", "Pérdidas de fricción con %DR (psi/km)",
+           "Presión int+geod (psig)", "Presión int (psig)", "MAOP (psig)", "MAOP+geod (psig)",
+           "Descuelgue", "Rotura tubo", "Lleno de línea", "Rating de Válvula (psi)"]
+    for tr, r in zip(proy.tramos, res):
+        wt = wb.create_sheet(f"Tramo {tr.nombre}"[:31])
+        wt["A1"] = f"Caudal {r.flujo_kbd:.4f} KBDO | %DR {r.dr:.4f} | FR {r.fr:.4f} | Rugosidad {tr.rugosidad_in} in" \
+                   f" | Eficiencia {tr.eficiencia}% | P.descarga {r.presion_descarga:.2f} | P.recibo {r.presion_recibo:.2f}"
+        encabezado(wt, 2, cab)
+        for k, pt in enumerate(tr.puntos):
+            vals = [pt.punto, pt.km, pt.altura, pt.espesor, pt.diam_ext, pt.smys, r.J[k], r.K[k], r.L[k],
+                    r.M[k], r.N[k], r.O[k], r.P[k], r.Q[k], r.R[k], r.S[k], r.T[k], pt.rating or None]
+            for j, v in enumerate(vals, 1):
+                c = wt.cell(k + 3, j, v)
+                if r.S[k]:
+                    c.fill = rojo
+                elif r.R[k]:
+                    c.fill = amar
+        wt.freeze_panes = "B3"
+
+    if curva:
+        wc = wb.create_sheet("Curva del sistema")
+        nombres = [e.nombre for e in proy.estaciones[:len(proy.tramos)]]
+        encabezado(wc, 1, ["KBDO"] + [f"P. desc. {n} (psig)" for n in nombres])
+        for i, (q, ps) in enumerate(curva, 2):
+            wc.cell(i, 1, q)
+            for j, v in enumerate(ps, 2):
+                wc.cell(i, j, v)
+
+    # Gráfico del perfil como imagen
+    try:
+        from openpyxl.drawing.image import Image as XLImage
+        from matplotlib.figure import Figure      # opcional: sin matplotlib no se pone la imagen
+        fig = Figure(figsize=(12, 5), dpi=100)
+        ax = fig.add_subplot(111)
+        for i, (tr, r) in enumerate(zip(proy.tramos, res)):
+            km = [p.km for p in tr.puntos]
+            ax.plot(km, r.J, color="#8c6d31", label="Presión geodésica" if i == 0 else None)
+            ax.plot(km, r.N, color="#1f77b4", label="Presión int+geod" if i == 0 else None)
+            ax.plot(km, r.Q, color="#d62728", ls="--", label="MAOP+geod" if i == 0 else None)
+        ax.set_xlabel("Distancia (km)")
+        ax.set_ylabel("Presión (psi)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png")
+        buf.seek(0)
+        img = XLImage(buf)
+        ws.add_image(img, "Q3")
+    except Exception:  # noqa: BLE001
+        pass
+    wb.save(ruta)

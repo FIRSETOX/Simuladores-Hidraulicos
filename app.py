@@ -422,6 +422,16 @@ with st.sidebar:
                     cargar_sistema(ok[0])
                     st.rerun()
 
+    with st.expander("💾 Copia de la base de datos"):
+        st.caption("Descargue simuladores.db para tener una copia. En Streamlit Cloud los cambios se pierden "
+                   "cuando la aplicación se reinicia: suba esta copia a GitHub para conservarlos.")
+        try:
+            with open(db.ruta, "rb") as fh:
+                st.download_button("⬇️ Descargar simuladores.db", fh.read(), file_name="simuladores.db",
+                                   use_container_width=True)
+        except OSError:
+            st.error("No se pudo leer la base de datos.")
+
     if ss.sistema:
         with st.expander("🗂️ Administrar sistema"):
             nuevo_nombre = st.text_input("Guardar como nuevo sistema / renombrar", value=ss.sistema)

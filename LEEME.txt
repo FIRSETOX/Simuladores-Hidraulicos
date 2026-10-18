@@ -1,0 +1,34 @@
+SIMULADOR HIDRÁULICO - VERSIÓN WEB (Streamlit)
+==============================================
+
+Archivos (todos en la misma carpeta):
+  app.py                      Página web (interfaz)
+  motor.py                    Cálculos (mismas fórmulas de la plantilla Excel)
+  simuladores.db              Base de datos de sistemas (trae SEBASTOPOL - TOCANCIPA)
+  requirements.txt            Librerías necesarias
+  .streamlit/config.toml      Colores y configuración (carpeta oculta: no la borre)
+  iniciar_simulador.bat       Doble clic para abrir el simulador en Windows
+  ejemplo_rangos_espesor.csv  Ejemplo para actualizar espesores por inspección
+
+0) LO MÁS FÁCIL: DESDE SPYDER
+   En Spyder: Archivo > Abrir > simulador_web\abrir_simulador_web.py  y presione F5.
+   Se abre una VENTANA NEGRA (el servidor) y luego el navegador en http://localhost:8501.
+   No cierre la ventana negra mientras usa la página. Si hay un error, aparece en esa ventana.
+
+1) PROBAR EN SU COMPUTADOR (desde la consola)
+   a. Abra "Anaconda Prompt" (o CMD si tiene Python instalado).
+   b. Vaya a la carpeta:          cd C:\ruta\de\simulador_web
+   c. Instale (solo la 1a vez):   pip install -r requirements.txt
+   d. Ejecute:                    streamlit run app.py
+      (o doble clic en iniciar_simulador.bat)
+   e. Se abre el navegador en http://localhost:8501
+   f. Otra persona de su misma red puede entrar con http://IP-DE-SU-PC:8501
+      (puede requerir que TI abra el puerto 8501 en el firewall).
+
+2) PUBLICAR EN UN SERVIDOR DE LA EMPRESA (recomendado: la información es clasificada)
+   - Servidor Windows o Linux con Python 3.10 o superior.
+   - Copiar esta carpeta, crear un entorno virtual e instalar requirements.txt.
+   - Dejar "streamlit run app.py --server.port 8501" corriendo como servicio.
+   - Publicarlo con HTTPS y el inicio de sesión corporativo (IIS o nginx + Microsoft Entra ID).
+   - Copia de seguridad diaria de simuladores.db.
+   Variable opcional SIMULADOR_BD = ruta de la base de datos (si TI la quiere en otra carpeta).
