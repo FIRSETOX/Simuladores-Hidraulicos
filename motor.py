@@ -20,6 +20,9 @@ from datetime import datetime
 
 
 
+
+
+
 # --------------------------------------------------------------------------
 # Constantes (las mismas que usa la hoja de cálculo)
 # --------------------------------------------------------------------------
@@ -77,6 +80,8 @@ class Tramo:
     puntos: list = field(default_factory=list)   # list[PuntoPerfil]
     rugosidad_in: float = 0.0018                 # B18
     eficiencia: float = 100.0                    # B20
+    formato_antiguo: bool = False                # plantillas antiguas: fórmula de fricción de esa versión
+    fila_inicio: int = 3                         # fila de Excel del primer punto (para referencia)
 
 
 @dataclass
@@ -116,7 +121,9 @@ class Proyecto:
         p.tramos = []
         for t in d.get("tramos", []):
             tr = Tramo(nombre=t["nombre"], rugosidad_in=t.get("rugosidad_in", 0.0018),
-                       eficiencia=t.get("eficiencia", 100.0))
+                       eficiencia=t.get("eficiencia", 100.0),
+                       formato_antiguo=t.get("formato_antiguo", t.get("dra_en_laminar", False)),
+                       fila_inicio=t.get("fila_inicio", 3))
             tr.puntos = [PuntoPerfil(**pp) for pp in t.get("puntos", [])]
             p.tramos.append(tr)
         return p
@@ -209,7 +216,19 @@ def calcular_tramo(tramo: Tramo, flujo_kbd, densidad, visc_cst, dr, fr, presion_
         j = p.altura * densidad * PSI_POR_M_KGM3
         v = q_si / (0.25 * math.pi * d_m ** 2) if d_m > 0 else 0.0
         re_ = densidad * v * d_m / mu if mu > 0 else 0.0
-        if re_ <= 0:
+        if tramo.formato_antiguo:
+            # columna K de las plantillas antiguas (misma correlación de Churchill escrita con
+            # constantes redondeadas; el %DR se aplica siempre)
+            if q_si <= 0 or d_in <= 0:
+                m = 0.0
+            else:
+                x = mu * d_in / (densidad * q_si)
+                a = 3.1781e-20 * x ** 12
+                b = 2.457 * math.log(0.17 * x ** 0.9 + 0.0106 * rug_mm / d_in)
+                c = 9.746e45 * x ** 16
+                m = ((800 / tramo.eficiencia) * (a + (b ** 16 + c) ** -1.5) ** (1 / 12) * densidad
+                     * (q_si / (math.pi * d_m ** 2 / 4)) ** 2 / d_m * 1000 / 100000 / 2 * 14.5 * (1 - dr / 100))
+        elif re_ <= 0:
             m = 0.0
         else:
             f = factor_friccion_churchill(re_, rug_mm, d_mm)
@@ -335,7 +354,7 @@ def interpolar_lista(proy: Proyecto, resultados, lista_km):
             "maop": lin(r.P), "p_int": lin(r.O), "maop_rem": lin(r.P) - lin(r.O), "p_int_geod": lin(r.N),
             "velocidad": lin(r.K), "nre": lin(r.L), "tramo": proy.tramos[idx].nombre,
             "inicio": proy.estaciones[idx].nombre, "fin": proy.estaciones[idx + 1].nombre,
-            "fila": n + 3})
+            "fila": n + proy.tramos[idx].fila_inicio})
     return salida
 
 
@@ -648,10 +667,11 @@ def _abrir_libro(ruta, **kw):
     return openpyxl.load_workbook(ruta, **kw)
 
 
-def _bloque(ws, max_fila, max_col):
+def _bloque(ws, max_fila, max_col, min_fila=1):
     """Lee un bloque de celdas de una hoja (modo rápido read_only) -> {(fila, col): valor}."""
     d = {}
-    for r, fila in enumerate(ws.iter_rows(min_row=1, max_row=max_fila, max_col=max_col, values_only=True), 1):
+    for r, fila in enumerate(ws.iter_rows(min_row=min_fila, max_row=max_fila, max_col=max_col, values_only=True),
+                             min_fila):
         for c, v in enumerate(fila, 1):
             if v is not None:
                 d[(r, c)] = v
@@ -672,11 +692,46 @@ def _nombre_hoja(valor, hojas):
     return None
 
 
-def importar_plantilla_excel(ruta, avance=None) -> Proyecto:
-    """Lee una plantilla del simulador (.xlsm/.xlsx).
+def _norm(v):
+    """Texto en minúsculas, sin tildes ni espacios repetidos (para buscar títulos)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(v)).encode("ascii", "ignore").decode().lower()
+    return " ".join(s.replace("\n", " ").split())
 
+
+def _es_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _buscar(celdas, condicion, max_fila=10 ** 6):
+    """Primera celda (fila, col) cuyo texto cumple la condición (recorre por filas)."""
+    for (r, c) in sorted(celdas):
+        v = celdas[(r, c)]
+        if r <= max_fila and isinstance(v, str) and condicion(_norm(v)):
+            return r, c
+    return None
+
+
+def _num_derecha(celdas, pos, max_dist=4):
+    """Primer número a la derecha de una etiqueta."""
+    if not pos:
+        return None
+    r, c = pos
+    for k in range(1, max_dist + 1):
+        v = celdas.get((r, c + k))
+        if _es_num(v):
+            return float(v)
+        if isinstance(v, str) and v.strip():
+            return None                  # otra etiqueta: la celda de esta etiqueta está vacía
+    return None
+
+
+def importar_plantilla_excel(ruta, avance=None) -> Proyecto:
+    """Lee una plantilla del simulador (.xlsm/.xlsx), versión nueva o antigua.
+
+    Los datos se ubican por sus TÍTULOS ("Flujo", "%DR", "Inicio Segmento", "dist.del reg."...),
+    no por posición fija, así funcionan las distintas versiones de la plantilla.
     ruta: ruta del archivo o su contenido en bytes. avance: función opcional avance(texto).
-    Usa el modo de lectura rápida de openpyxl (sirve para plantillas grandes).
     Los avisos de la importación quedan en proy.avisos_importacion (lista de textos).
     """
     def aviso(t):
@@ -686,72 +741,140 @@ def importar_plantilla_excel(ruta, avance=None) -> Proyecto:
     aviso("Abriendo el libro…")
     wb_v = _abrir_libro(ruta, data_only=True, read_only=True)     # valores calculados
     wb_f = _abrir_libro(ruta, data_only=False, read_only=True)    # fórmulas (nombres / bypass)
-    hojas = wb_v.sheetnames
-    if "Resumen" not in hojas:
+    hojas = [h for h in wb_v.sheetnames if hasattr(wb_v[h], "iter_rows")]   # sin hojas de gráfico
+    hoja_res = next((h for h in hojas if _norm(h) == "resumen"), None)
+    if hoja_res is None:
         raise ValueError("El libro no tiene la hoja 'Resumen'.")
     proy = Proyecto()
     avisos = []
 
-    if "REF" in hojas:
+    # ---------------- productos (hoja REF)
+    hoja_ref = next((h for h in hojas if _norm(h) == "ref"), None)
+    if hoja_ref:
         prods = []
-        for fila in wb_v["REF"].iter_rows(min_row=2, max_col=8, values_only=True):
+        for fila in wb_v[hoja_ref].iter_rows(min_row=1, max_col=8, values_only=True):
             fila = list(fila) + [None] * (8 - len(fila))
-            if fila[0] in (None, "") or fila[2] is None:
+            if fila[0] in (None, "") or not _es_num(fila[2]):
                 continue
             prods.append([str(fila[0])] + [fila[c] for c in (2, 3, 4, 5, 6, 7)])
         if prods:
             proy.productos = prods
+    nombres_prod = {_norm(p[0]): p for p in proy.productos}
 
+    # ---------------- hoja Resumen
     aviso("Leyendo la hoja Resumen…")
-    rv = _bloque(wb_v["Resumen"], 40, 12)
-    rf = _bloque(wb_f["Resumen"], 40, 12)
-    proy.sistema = str(rv.get((2, 2), "") or "").strip()
-    proy.fecha = str(rv.get((3, 2), "") or "")
-    proy.responsable = str(rv.get((3, 6), "") or "")
-    proy.flujo_kbd = _num(rv.get((5, 3)), 0)
-    proy.iny1_bph = _num(rv.get((5, 6)), 0)
-    proy.iny2_bph = _num(rv.get((5, 9)), 0) or _num(rv.get((5, 8)), 0)
-    proy.producto = str(rv.get((7, 1), "GM") or "GM")
-    proy.densidad = _num(rv.get((6, 3)), 0)
-    proy.viscosidad = _num(rv.get((7, 3)), 0)
-    for p in proy.productos:
-        if p[0] == proy.producto:
-            proy.densidad = proy.densidad or _num(p[1])
-            proy.viscosidad = proy.viscosidad or _num(p[2])
+    rv = _bloque(wb_v[hoja_res], 60, 25)
+    rf = _bloque(wb_f[hoja_res], 60, 25)
+    enc = _buscar(rv, lambda t: t.startswith("inicio segmento"))
+    if not enc:
+        raise ValueError("No encontré la tabla de estaciones ('Inicio Segmento') en la hoja Resumen.")
+    hr, c0 = enc
+    col = {}
+    for (r, c), v in rv.items():
+        if r == hr and isinstance(v, str):
+            t = _norm(v)
+            if t.startswith("ubicaci"):
+                col["km"] = c
+            elif "recibo" in t:
+                col["recibo"] = c
+            elif "descarga" in t:
+                col["descarga"] = c
+            elif t.startswith("flujo"):
+                col["flujo"] = c
+            elif t == "tramo":
+                col["tramo"] = c
+            elif t.startswith("inyecci"):
+                col["iny"] = c
 
-    # Estaciones (filas 15..35). La columna H dice la hoja del tramo (valor calculado).
+    sis = _buscar(rv, lambda t: t.startswith("sistema"), hr)
+    if sis:
+        proy.sistema = str(next((rv[(sis[0], c)] for c in range(sis[1] + 1, sis[1] + 6)
+                                 if isinstance(rv.get((sis[0], c)), str)), "")).strip()
+    fec = _buscar(rv, lambda t: t.startswith("fecha"), hr)
+    if fec:
+        v = next((rv[(fec[0], c)] for c in range(fec[1] + 1, fec[1] + 4) if rv.get((fec[0], c)) is not None), "")
+        proy.fecha = v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v)
+    res_ = _buscar(rv, lambda t: t.startswith("responsable"), hr)
+    if res_:
+        proy.responsable = str(next((rv[(res_[0], c)] for c in range(res_[1] + 1, res_[1] + 6)
+                                     if isinstance(rv.get((res_[0], c)), str)), ""))
+
+    proy.flujo_kbd = _num_derecha(rv, _buscar(rv, lambda t: t.startswith("flujo"), hr - 1)) or 0.0
+    proy.iny1_bph = _num_derecha(rv, _buscar(rv, lambda t: t.replace(" ", "") == "iny1", hr - 1)) or 0.0
+    proy.iny2_bph = _num_derecha(rv, _buscar(rv, lambda t: t.replace(" ", "") == "iny2", hr - 1)) or 0.0
+
+    # producto: a la derecha (formato antiguo) o debajo (formato nuevo) de la etiqueta "Producto(s)"
+    pp = _buscar(rv, lambda t: t in ("producto", "productos"), hr - 1)
+    producto = None
+    if pp:
+        for pos in ((pp[0], pp[1] + 1), (pp[0], pp[1] + 2), (pp[0] + 1, pp[1])):
+            v = rv.get(pos)
+            if isinstance(v, str) and _norm(v) in nombres_prod:
+                producto = v
+                break
+    proy.producto = producto or "GM"
+    proy.densidad = _num_derecha(rv, _buscar(rv, lambda t: t.startswith("densidad"), hr - 1), 6) or 0.0
+    proy.viscosidad = _num_derecha(rv, _buscar(rv, lambda t: t.startswith("viscosidad"), hr - 1), 6) or 0.0
+    p_ref = nombres_prod.get(_norm(proy.producto))
+    if p_ref:
+        proy.densidad = proy.densidad or _num(p_ref[1])
+        proy.viscosidad = proy.viscosidad or _num(p_ref[2])
+
+    # filas de %DR y FR: valores a la derecha de la etiqueta, uno por tramo
+    def fila_valores(pos):
+        if not pos:
+            return []
+        r, c = pos
+        return [rv.get((r, c + 1 + k)) for k in range(20)]
+    drs = fila_valores(_buscar(rv, lambda t: t in ("%dr", "%dra", "% dr", "% dra"), hr - 1))
+    frs = fila_valores(_buscar(rv, lambda t: t == "fr", hr - 1))
+    fr_comun = next((float(v) for v in frs if _es_num(v)), 1 / 1.1)
+
+    # ---------------- estaciones y tramos
     filas_est = []
-    fila = 15
-    while fila <= 35 and rf.get((fila, 1)) not in (None, ""):
-        filas_est.append(fila)
-        fila += 1
+    r = hr + 1
+    while r <= 60:
+        v = rf.get((r, c0)) if rf.get((r, c0)) not in (None, "") else rv.get((r, c0))
+        if v in (None, "") or _norm(v).startswith("total"):
+            break
+        filas_est.append(r)
+        r += 1
     usadas = set()
+    antiguo = False
     for k, fila in enumerate(filas_est):
-        idx = fila - 15
-        c_f = rf.get((fila, 3))
-        paso = isinstance(c_f, str) and c_f.replace("$", "").strip().upper() == "=D%d" % fila
+        c_rec = col.get("recibo")
+        c_f = rf.get((fila, c_rec)) if c_rec else None
+        c_desc = col.get("descarga")
+        paso = bool(c_desc) and isinstance(c_f, str) and \
+            c_f.replace("$", "").strip().upper() == "=%s%d" % (_letra(c_desc), fila)
+        dr = drs[k] if k < len(drs) and _es_num(drs[k]) else 0.0
+        fr = frs[k] if k < len(frs) and _es_num(frs[k]) and frs[k] > 0 else fr_comun
+        iny = str(rv.get((fila, col["iny"])) or "Sin inyección") if "iny" in col else "Sin inyección"
         est = Estacion(
-            nombre=_nombre_hyperlink(rf.get((fila, 1))) or str(rv.get((fila, 1), f"EST {k + 1}")),
-            presion_recibo=_num(rv.get((fila, 3)), 0),
-            paso_directo=paso,
-            dr=_num(rv.get((10, 2 + idx)), 0),
-            fr=_num(rv.get((11, 2 + idx)), 1 / 1.1),
-            inyeccion=str(rv.get((fila, 10), "Sin inyección") or "Sin inyección"),
-        )
-        if est.inyeccion not in INYECCIONES:
-            est.inyeccion = "Sin inyección"
+            nombre=_nombre_hyperlink(rf.get((fila, c0))) or str(rv.get((fila, c0), f"EST {k + 1}")),
+            presion_recibo=_num(rv.get((fila, c_rec)), 0) if c_rec else 0.0,
+            paso_directo=paso, dr=float(dr), fr=float(fr),
+            inyeccion=iny if iny in INYECCIONES else "Sin inyección")
         proy.estaciones.append(est)
         if k == len(filas_est) - 1:
             break                                         # la última estación no inicia tramo
-        hoja = _nombre_hoja(rv.get((fila, 8)), hojas) or _nombre_hoja(rf.get((fila, 8)), hojas)
+        valor_h = rv.get((fila, col["tramo"])) if "tramo" in col else None
+        hoja = _nombre_hoja(valor_h, hojas) or (_nombre_hoja(rf.get((fila, col["tramo"])), hojas)
+                                                  if "tramo" in col else None)
         if hoja is None:
-            avisos.append(f"La estación {est.nombre} (fila {fila}) no tiene hoja de tramo válida en la columna H.")
+            hoja = _nombre_hoja(str(k + 1), hojas)        # hojas numeradas 1, 2, 3…
+        if hoja is None:
+            avisos.append(f"La estación {est.nombre} (fila {fila}) no tiene hoja de tramo válida.")
             break
         if hoja in usadas:
-            avisos.append(f"La hoja '{hoja}' aparece repetida en la columna H (fila {fila}).")
+            avisos.append(f"La hoja '{hoja}' aparece repetida en la columna Tramo (fila {fila}).")
         usadas.add(hoja)
         aviso(f"Leyendo el tramo '{hoja}'…")
-        proy.tramos.append(_leer_tramo(wb_v[hoja], hoja))
+        tr, es_antiguo = _leer_tramo(wb_v[hoja], hoja)
+        antiguo = antiguo or es_antiguo
+        if not tr.puntos:
+            avisos.append(f"La hoja '{hoja}' no tiene puntos de perfil.")
+        proy.tramos.append(tr)
     proy.estaciones = proy.estaciones[:len(proy.tramos) + 1]
     for i in range(1, len(proy.tramos)):
         a, b = proy.tramos[i - 1].puntos, proy.tramos[i].puntos
@@ -759,33 +882,90 @@ def importar_plantilla_excel(ruta, avance=None) -> Proyecto:
             avisos.append(f"El tramo '{proy.tramos[i - 1].nombre}' termina en km {a[-1].km:.3f} y el siguiente "
                           f"empieza en km {b[0].km:.3f}.")
 
-    # km de la tabla de interpolación (fila 66 en adelante, columna A)
+    # ---------------- km de la tabla de interpolación
     km = []
-    for (v,) in wb_v["Resumen"].iter_rows(min_row=66, max_col=1, values_only=True):
-        if v is None:
+    ws_res = wb_v[hoja_res]
+    fila_int = None
+    for r, (v,) in enumerate(ws_res.iter_rows(min_row=1, max_row=400, max_col=1, values_only=True), 1):
+        if isinstance(v, str) and _norm(v).startswith("dist.del reg"):
+            fila_int = r
             break
-        if isinstance(v, (int, float)):
-            km.append(float(v))
+    if fila_int:
+        for (v,) in ws_res.iter_rows(min_row=fila_int + 1, max_col=1, values_only=True):
+            if v is None:
+                break
+            if _es_num(v):
+                km.append(float(v))
     if km:
         proy.km_interpolar = km
     proy.avisos_importacion = avisos
+    proy.formato_antiguo = antiguo
     return proy
 
 
-def _leer_tramo(ws, nombre) -> Tramo:
-    par = _bloque(ws, 20, 2)
-    t = Tramo(nombre=nombre, rugosidad_in=_num(par.get((18, 2)), 0.0018),
-              eficiencia=_num(par.get((20, 2)), 100) or 100)
-    for row in ws.iter_rows(min_row=3, min_col=4, max_col=21, values_only=True):
-        row = list(row) + [None] * (18 - len(row))
-        d, e, f, g, h, i = row[0:6]
-        u = row[17]
-        if e is None or e == "":
+def _letra(c):
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(c)
+
+
+def _leer_tramo(ws, nombre):
+    """Lee una hoja de tramo. Devuelve (Tramo, es_formato_antiguo)."""
+    cab = _bloque(ws, 6, 30)
+    pos = _buscar(cab, lambda t: t.startswith("dist.del reg") or t.startswith("dist. del reg"))
+    if not pos:
+        raise ValueError(f"La hoja '{nombre}' no tiene la columna 'dist.del reg. [km]'.")
+    hr = pos[0]
+    col = {}
+    for (r, c), v in cab.items():
+        if r == hr and isinstance(v, str):
+            t = _norm(v)
+            if t.startswith("punto"):
+                col["punto"] = c
+            elif t.startswith("dist"):
+                col["km"] = c
+            elif t.startswith("altura"):
+                col["altura"] = c
+            elif t.startswith("esp"):
+                col["esp"] = c
+            elif t.startswith("diam"):
+                col["diam"] = c
+            elif t.startswith("smys"):
+                col["smys"] = c
+            elif t.startswith("rating"):
+                col["rating"] = c
+            elif t == "nre":
+                col["nre"] = c
+    for k in ("altura", "esp", "diam", "smys"):
+        if k not in col:
+            raise ValueError(f"La hoja '{nombre}' no tiene la columna de {k}.")
+    antiguo = "nre" not in col                 # las plantillas antiguas no tienen Reynolds
+
+    # parámetros de la columna A/B: rugosidad (in) y eficiencia
+    par = _bloque(ws, 40, 2)
+    rug, eff = 0.0018, 100.0
+    for (r, c), v in par.items():
+        if c == 1 and isinstance(v, str):
+            t = _norm(v)
+            if t.startswith("rugosidad") and "( in" in t.replace("(in", "( in") and _es_num(par.get((r, 2))):
+                rug = float(par[(r, 2)])
+            elif t.startswith("eficiencia") and _es_num(par.get((r, 2))):
+                eff = float(par[(r, 2)]) or 100.0
+    t = Tramo(nombre=nombre, rugosidad_in=rug, eficiencia=eff, formato_antiguo=antiguo, fila_inicio=hr + 1)
+    ultima = max(col.values())
+    for row in ws.iter_rows(min_row=hr + 1, max_col=ultima, values_only=True):
+        row = list(row) + [None] * (ultima - len(row))
+
+        def v(clave, defecto=None):
+            c = col.get(clave)
+            return row[c - 1] if c else defecto
+        km = v("km")
+        if km is None or km == "":
             break
-        if f is None or not isinstance(e, (int, float)):
+        if not _es_num(km) or not _es_num(v("altura")):
             continue
-        t.puntos.append(PuntoPerfil(str(d or ""), _num(e), _num(f), _num(g), _num(h), _num(i), _num(u, 0)))
-    return t
+        t.puntos.append(PuntoPerfil(str(v("punto") or ""), float(km), _num(v("altura")), _num(v("esp")),
+                                    _num(v("diam")), _num(v("smys")), _num(v("rating"), 0)))
+    return t, antiguo
 
 
 # --------------------------------------------------------------------------

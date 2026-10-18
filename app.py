@@ -617,7 +617,7 @@ with tabs[1]:
             "Presión int+geod (psig)": r.N, "Presión int (psig)": r.O, "MAOP (psig)": r.P, "MAOP+geod (psig)": r.Q,
             f"Descuelgue: {r.descuelgues}": r.R, f"Rotura tubo: {r.roturas}": r.S, "Lleno de línea": r.T,
             "Rating de Válvula (psi)": [x.rating or None for x in t.puntos]})
-        df.index = range(3, len(df) + 3)
+        df.index = range(t.fila_inicio, len(df) + t.fila_inicio)
         if solo:
             vista = df[df[f"Rotura tubo: {r.roturas}"] | df[f"Descuelgue: {r.descuelgues}"]]
             st.dataframe(vista.style.format(precision=2).apply(
