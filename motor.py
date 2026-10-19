@@ -23,6 +23,9 @@ from datetime import datetime
 
 
 
+
+
+
 # --------------------------------------------------------------------------
 # Constantes (las mismas que usa la hoja de cálculo)
 # --------------------------------------------------------------------------
@@ -82,6 +85,8 @@ class Tramo:
     eficiencia: float = 100.0                    # B20
     formato_antiguo: bool = False                # plantillas antiguas: fórmula de fricción de esa versión
     fila_inicio: int = 3                         # fila de Excel del primer punto (para referencia)
+    dra_siempre: bool = False                    # formato con Barlow: el %DR se aplica también en laminar
+    factor_q: float = 35000 / 220.5 / 24 / 3600  # m3/s por KBDO (la plantilla Barlow usa 0.00004416 por bph)
 
 
 @dataclass
@@ -92,6 +97,7 @@ class Estacion:
     dr: float = 0.0                  # %DR del tramo que inicia en esta estación (fila 10)
     fr: float = 1 / 1.1              # Factor de rotura (fila 11)
     inyeccion: str = "Sin inyección"  # Resumen col J
+    delta_bph: float = 0.0           # inyección (+) / entrega al paso (−) en la estación, bph
 
 
 @dataclass
@@ -109,6 +115,7 @@ class Proyecto:
     tramos: list = field(default_factory=list)      # n tramos
     productos: list = field(default_factory=lambda: [list(p) for p in PRODUCTOS_DEFECTO])
     km_interpolar: list = field(default_factory=lambda: [5, 20, 90, 100])
+    perfiles_externos: list = field(default_factory=list)   # perfiles MOP / transitorios cargados
 
     # ---------------- serialización ----------------
     def to_dict(self):
@@ -116,14 +123,18 @@ class Proyecto:
 
     @staticmethod
     def from_dict(d):
-        p = Proyecto(**{k: v for k, v in d.items() if k not in ("estaciones", "tramos")})
-        p.estaciones = [Estacion(**e) for e in d.get("estaciones", [])]
+        from dataclasses import fields as _campos
+        validos = {f.name for f in _campos(Proyecto)} - {"estaciones", "tramos"}
+        p = Proyecto(**{k: v for k, v in d.items() if k in validos})
+        campos_est = {f.name for f in _campos(Estacion)}
+        p.estaciones = [Estacion(**{k: v for k, v in e.items() if k in campos_est}) for e in d.get("estaciones", [])]
         p.tramos = []
         for t in d.get("tramos", []):
             tr = Tramo(nombre=t["nombre"], rugosidad_in=t.get("rugosidad_in", 0.0018),
                        eficiencia=t.get("eficiencia", 100.0),
                        formato_antiguo=t.get("formato_antiguo", t.get("dra_en_laminar", False)),
-                       fila_inicio=t.get("fila_inicio", 3))
+                       fila_inicio=t.get("fila_inicio", 3), dra_siempre=t.get("dra_siempre", False),
+                       factor_q=t.get("factor_q", KBD_A_M3S))
             tr.puntos = [PuntoPerfil(**pp) for pp in t.get("puntos", [])]
             p.tramos.append(tr)
         return p
@@ -201,7 +212,7 @@ def factor_friccion_churchill(re, rug_mm, d_mm):
 
 def calcular_tramo(tramo: Tramo, flujo_kbd, densidad, visc_cst, dr, fr, presion_recibo):
     n = len(tramo.puntos)
-    q_si = flujo_kbd * KBD_A_M3S
+    q_si = flujo_kbd * tramo.factor_q
     mu = visc_cst * densidad / 1e6
     rug_mm = tramo.rugosidad_in * IN_A_MM
     res = ResultadoTramo(tramo.nombre, flujo_kbd, q_si, presion_recibo, dr, fr)
@@ -233,7 +244,7 @@ def calcular_tramo(tramo: Tramo, flujo_kbd, densidad, visc_cst, dr, fr, presion_
         else:
             f = factor_friccion_churchill(re_, rug_mm, d_mm)
             m = ((100 / tramo.eficiencia) * f * densidad * v ** 2 / d_m * 1000 / 100000 / 2) * 14.5
-            if re_ > RE_LAMINAR:
+            if re_ > RE_LAMINAR or tramo.dra_siempre:
                 m *= (1 - dr / 100)
         maop = p.rating if (p.rating or 0) > 0 else FACTOR_DISENO * 2 * p.smys * p.espesor / p.diam_ext
         J.append(j); K.append(v); L.append(re_); M.append(m); P.append(maop)
@@ -274,6 +285,7 @@ def flujos_por_tramo(proy: Proyecto):
             f = prev + proy.iny2_bph * BPH_A_KBD
         elif est.inyeccion == "INY 1":
             f = prev + proy.iny1_bph * BPH_A_KBD
+        f += (est.delta_bph or 0.0) * BPH_A_KBD
         flujos.append(f)
         prev = f
     return flujos
@@ -640,6 +652,200 @@ def leer_rangos_inspeccion(ruta):
         filas.append((a, b, e, nota))
     return filas
 
+
+# --------------------------------------------------------------------------
+# PERFILES DE PRESIÓN EXTERNOS (MOP, transitorios / disparo de válvulas de SPS)
+# y verificación contra la presión de diseño (Barlow / MAOP)
+# --------------------------------------------------------------------------
+TIPOS_PERFIL = ("MOP", "Transitorio", "Otro")
+
+
+def _texto_norm(v):
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(v)).encode("ascii", "ignore").decode().lower()
+    return " ".join(s.replace("\n", " ").split())
+
+
+def leer_perfil_presion(origen, nombre_archivo=None):
+    """Lee un perfil de presión interna (Excel o CSV) con columnas tipo 'Abscisa (Km)' y 'Presion Interna'.
+
+    origen: ruta del archivo, o (nombre, bytes) de un archivo subido.
+    Devuelve dict {nombre, tipo, archivo, km: [...], p: [...], fecha_carga}.
+    """
+    if isinstance(origen, tuple):
+        nombre_archivo, contenido = origen
+    else:
+        nombre_archivo = nombre_archivo or os.path.basename(origen)
+        with open(origen, "rb") as fh:
+            contenido = fh.read()
+    if nombre_archivo.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(contenido), data_only=True, read_only=True)
+        ws = next(w for w in wb.worksheets if hasattr(w, "iter_rows"))
+        filas = [list(r) for r in ws.iter_rows(values_only=True)]
+    else:
+        texto = contenido.decode("utf-8-sig", errors="replace")
+        dialecto = csv.Sniffer().sniff(texto[:4096], delimiters=",;\t")
+        filas = [list(r) for r in csv.reader(io.StringIO(texto), dialecto)]
+
+    # fila de encabezados: la que tiene una columna de km y una de presión interna
+    c_km = c_p = fila_enc = None
+    for i, fila in enumerate(filas[:60]):
+        textos = {j: _texto_norm(v) for j, v in enumerate(fila) if isinstance(v, str) and v.strip()}
+        km = next((j for j, t in textos.items() if t.startswith(("abscisa", "km", "dist", "ubicacion",
+                                                                   "kilometr"))), None)
+        pr = next((j for j, t in textos.items() if "presion interna" in t or t.startswith("presion int")), None)
+        if pr is None:
+            pr = next((j for j, t in textos.items() if t.startswith("presion") and "geod" not in t
+                       and "diseno" not in t and "despacho" not in t and "recibo" not in t), None)
+        if km is not None and pr is not None:
+            c_km, c_p, fila_enc = km, pr, i
+            break
+    if fila_enc is None:
+        raise ValueError("No encontré las columnas de abscisa (km) y presión interna en el archivo.")
+
+    km, p = [], []
+    for fila in filas[fila_enc + 1:]:
+        if len(fila) <= max(c_km, c_p):
+            continue
+        a, b = fila[c_km], fila[c_p]
+        try:
+            a = float(str(a).replace(",", ".")) if not isinstance(a, (int, float)) else float(a)
+            b = float(str(b).replace(",", ".")) if not isinstance(b, (int, float)) else float(b)
+        except (TypeError, ValueError):
+            continue
+        km.append(a)
+        p.append(b)
+    if len(km) < 2:
+        raise ValueError("El perfil tiene menos de 2 puntos con km y presión.")
+    orden = sorted(range(len(km)), key=lambda k: km[k])
+    km, p = [km[k] for k in orden], [p[k] for k in orden]
+
+    # nombre y tipo: textos de las primeras filas (p.ej. 'SEBTOC-260226-MOP' / 'TRANSITORIO')
+    textos = [str(v).strip() for fila in filas[:fila_enc] for v in fila if isinstance(v, str) and v.strip()]
+    base = os.path.splitext(os.path.basename(nombre_archivo))[0]
+    nombre = next((t for t in textos if "-" in t and " " not in t), base)
+    todo = _texto_norm(" ".join(textos[:6]) + " " + base)
+    tipo = "Transitorio" if ("transit" in todo or "disparo" in todo or "sps" in todo) else (
+        "MOP" if "mop" in todo else "Otro")
+    return {"nombre": nombre, "tipo": tipo, "archivo": os.path.basename(nombre_archivo), "km": km, "p": p,
+            "fecha_carga": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+
+def _barlow_en_km(proy, res, km_lista):
+    """Presión de diseño (columna MAOP/Barlow del simulador) en cada km: la de la tubería en ese punto
+    (si en ese km hay varias filas, la menor)."""
+    from bisect import bisect_right, bisect_left
+    kms = km_estaciones(proy)
+    inicios = kms[:len(proy.tramos)]
+    E = [[p.km for p in t.puntos] for t in proy.tramos]
+    salida = []
+    for x in km_lista:
+        if not proy.tramos or x < kms[0] or x > kms[-1]:
+            salida.append(None)
+            continue
+        idx = max(0, bisect_right(inicios, x) - 1)
+        e, P = E[idx], res[idx].P
+        a, b = bisect_left(e, x), bisect_right(e, x)
+        if b > a:                                  # km exacto de una o varias filas
+            salida.append(min(P[a:b]))
+        else:
+            salida.append(P[max(0, b - 1)])
+    return salida
+
+
+TOLERANCIA_DEFECTO = {"MOP": 0.0, "Transitorio": 10.0, "Otro": 0.0}
+
+
+def tolerancia_perfil(perfil):
+    """% que se permite superar la presión de diseño (transitorios: 10 % por defecto)."""
+    t = perfil.get("tolerancia_pct")
+    return float(t) if t is not None else TOLERANCIA_DEFECTO.get(perfil.get("tipo"), 0.0)
+
+
+def verificar_perfil(proy, res, perfil, tolerancia_pct=None):
+    """Compara un perfil de presión interna con la presión de diseño (Barlow / MAOP) del sistema.
+
+    Evalúa en los km del perfil y en todos los puntos del simulador dentro del rango del perfil
+    (interpolando el perfil). Para cada punto calcula el exceso en psi y en % de la presión de diseño:
+        exceso % = (P perfil − P diseño) / P diseño × 100
+    tolerancia_pct: % permitido por encima de la presión de diseño (p.ej. 10 % en transitorios).
+    """
+    from bisect import bisect_right
+    tol = tolerancia_perfil(perfil) if tolerancia_pct is None else float(tolerancia_pct)
+    kp, pp = perfil["km"], perfil["p"]
+
+    def p_perfil(x):
+        if x < kp[0] or x > kp[-1]:
+            return None
+        n = min(max(bisect_right(kp, x) - 1, 0), len(kp) - 2)
+        x0, x1 = kp[n], kp[n + 1]
+        return pp[n] if x1 == x0 else pp[n] + (pp[n + 1] - pp[n]) * (x - x0) / (x1 - x0)
+
+    crudos = []
+    for x, pr, bw in zip(kp, pp, _barlow_en_km(proy, res, kp)):
+        if bw is not None:
+            crudos.append((x, pr, bw, "perfil"))
+    for t, r in zip(proy.tramos, res):
+        for pt, bw in zip(t.puntos, r.P):
+            pr = p_perfil(pt.km)
+            if pr is not None:
+                crudos.append((pt.km, pr, bw, pt.punto or "simulador"))
+    crudos.sort(key=lambda z: z[0])
+    # cada punto: (km, P perfil, P diseño, punto, exceso psi, exceso %, estado)
+    puntos = []
+    for x, pr, bw, nom in crudos:
+        ex = pr - bw
+        pct = 100.0 * ex / bw if bw else 0.0
+        if ex <= 0:
+            estado = "Cumple"
+        elif pct <= tol + 1e-9:
+            estado = f"Supera (dentro del {tol:g} %)"
+        else:
+            estado = f"Supera (fuera del {tol:g} %)" if tol > 0 else "Supera"
+        puntos.append((x, pr, bw, nom, ex, pct, estado))
+    excesos = [z for z in puntos if z[4] > 0]
+    fuera = [z for z in excesos if z[5] > tol + 1e-9]
+
+    # rangos continuos de km donde se supera la presión de diseño
+    rangos, actual = [], None
+    for z in puntos:
+        if z[4] > 0:
+            if actual is None:
+                actual = {"km_ini": z[0], "km_fin": z[0], "max_pct": z[5], "km_max": z[0], "max_psi": z[4],
+                          "n": 1, "fuera": z[5] > tol + 1e-9}
+            else:
+                actual["km_fin"] = z[0]
+                actual["n"] += 1
+                actual["fuera"] = actual["fuera"] or z[5] > tol + 1e-9
+                if z[5] > actual["max_pct"]:
+                    actual.update(max_pct=z[5], km_max=z[0], max_psi=z[4])
+        elif actual is not None:
+            rangos.append(actual)
+            actual = None
+    if actual is not None:
+        rangos.append(actual)
+
+    peor = max(puntos, key=lambda z: z[5]) if puntos else None
+    if not excesos:
+        resultado = "Cumple"
+    elif not fuera and tol > 0:
+        resultado = f"Supera la presión de diseño, dentro del {tol:g} % permitido"
+    else:
+        resultado = "Supera la presión de diseño" + (f" más del {tol:g} % permitido" if tol > 0 else "")
+    return {
+        "nombre": perfil["nombre"], "tipo": perfil["tipo"], "tolerancia_pct": tol, "n_puntos": len(puntos),
+        "cumple": not excesos, "aceptable": not fuera, "resultado": resultado,
+        "n_excesos": len(excesos), "n_fuera": len(fuera), "excesos": excesos, "rangos": rangos,
+        "max_exceso_pct": peor[5] if peor else None, "max_exceso_psi": peor[4] if peor else None,
+        "km_max_exceso": peor[0] if peor else None, "p_en_max": peor[1] if peor else None,
+        "diseno_en_max": peor[2] if peor else None,
+        "margen_min": -peor[4] if peor else None, "km_margen_min": peor[0] if peor else None,
+        "p_en_margen_min": peor[1] if peor else None, "barlow_en_margen_min": peor[2] if peor else None,
+        "uso_max_pct": (100 + peor[5]) if peor else None, "km_uso_max": peor[0] if peor else None,
+        "puntos": puntos,
+    }
+
 # --------------------------------------------------------------------------
 # Importación desde la plantilla Excel
 # --------------------------------------------------------------------------
@@ -742,9 +948,12 @@ def importar_plantilla_excel(ruta, avance=None) -> Proyecto:
     wb_v = _abrir_libro(ruta, data_only=True, read_only=True)     # valores calculados
     wb_f = _abrir_libro(ruta, data_only=False, read_only=True)    # fórmulas (nombres / bypass)
     hojas = [h for h in wb_v.sheetnames if hasattr(wb_v[h], "iter_rows")]   # sin hojas de gráfico
+    if any(_norm(h).startswith("datos de entrada") for h in hojas) and \
+            any(_norm(h).startswith("perfil hidraulico") for h in hojas):
+        return _importar_formato_barlow(wb_v, wb_f, hojas, aviso)
     hoja_res = next((h for h in hojas if _norm(h) == "resumen"), None)
     if hoja_res is None:
-        raise ValueError("El libro no tiene la hoja 'Resumen'.")
+        raise ValueError("El libro no tiene la hoja 'Resumen' (ni 'Datos de entrada' + 'Perfil hidráulico').")
     proy = Proyecto()
     avisos = []
 
@@ -883,23 +1092,216 @@ def importar_plantilla_excel(ruta, avance=None) -> Proyecto:
                           f"empieza en km {b[0].km:.3f}.")
 
     # ---------------- km de la tabla de interpolación
-    km = []
-    ws_res = wb_v[hoja_res]
-    fila_int = None
-    for r, (v,) in enumerate(ws_res.iter_rows(min_row=1, max_row=400, max_col=1, values_only=True), 1):
-        if isinstance(v, str) and _norm(v).startswith("dist.del reg"):
-            fila_int = r
-            break
-    if fila_int:
-        for (v,) in ws_res.iter_rows(min_row=fila_int + 1, max_col=1, values_only=True):
-            if v is None:
-                break
-            if _es_num(v):
-                km.append(float(v))
+    km = _km_interpolacion(wb_v[hoja_res])
     if km:
         proy.km_interpolar = km
     proy.avisos_importacion = avisos
     proy.formato_antiguo = antiguo
+    return proy
+
+
+def _texto_derecha(celdas, pos, max_dist=6):
+    if not pos:
+        return None
+    r, c = pos
+    for k in range(1, max_dist + 1):
+        v = celdas.get((r, c + k))
+        if v not in (None, "") and not _es_num(v):
+            return v
+        if _es_num(v):
+            return None
+    return None
+
+
+def _km_interpolacion(ws):
+    """km de la tabla 'Interpolación de puntos requeridos' (columna bajo 'dist.del reg. [km]')."""
+    pos = None
+    for r, fila in enumerate(ws.iter_rows(min_row=1, max_row=400, max_col=30, values_only=True), 1):
+        for c, v in enumerate(fila, 1):
+            if isinstance(v, str) and _norm(v).startswith("dist.del reg"):
+                pos = (r, c)
+                break
+        if pos:
+            break
+    if not pos:
+        return []
+    km, vacios = [], 0
+    for (v,) in ws.iter_rows(min_row=pos[0] + 1, max_row=pos[0] + 5000, min_col=pos[1], max_col=pos[1],
+                             values_only=True):
+        if _es_num(v):
+            km.append(float(v))
+            vacios = 0
+        else:
+            vacios += 1
+            if vacios > 5:
+                break
+    return km
+
+
+def _importar_formato_barlow(wb_v, wb_f, hojas, aviso):
+    """Plantilla nueva: hojas 'Datos de entrada', 'Perfil hidráulico' (un solo perfil continuo con la
+    'Presión de diseño Barlow') y 'Propiedades fluido'. Caudales en bph por estación."""
+    proy = Proyecto()
+    avisos = []
+    h_dat = next(h for h in hojas if _norm(h).startswith("datos de entrada"))
+    h_per = next(h for h in hojas if _norm(h).startswith("perfil hidraulico"))
+    h_flu = next((h for h in hojas if _norm(h).startswith("propiedades fluido")), None)
+
+    if h_flu:
+        filas = [list(r) for r in wb_v[h_flu].iter_rows(max_row=60, max_col=12, values_only=True)]
+        enc = next(((i, j) for i, f in enumerate(filas) for j, v in enumerate(f)
+                    if isinstance(v, str) and _norm(v) == "producto"), None)
+        if enc:
+            i0, j0 = enc
+            cab = [_norm(v) if isinstance(v, str) else "" for v in filas[i0]]
+            j_den = next((j for j, t in enumerate(cab) if t.startswith("densidad")), j0 + 1)
+            j_vis = next((j for j, t in enumerate(cab) if t.startswith("viscosidad")), None)
+            prods = []
+            for f in filas[i0 + 1:]:
+                f = f + [None] * (12 - len(f))
+                if isinstance(f[j0], str) and f[j0].strip() and _es_num(f[j_den]) and \
+                        j_vis is not None and _es_num(f[j_vis]):
+                    prods.append([f[j0].strip(), float(f[j_den]), float(f[j_vis]), None, None, None, None])
+            if prods:
+                proy.productos = prods
+
+    aviso("Leyendo 'Datos de entrada'…")
+    dv = _bloque(wb_v[h_dat], 60, 30)
+    df_ = _bloque(wb_f[h_dat], 60, 30)
+    enc = _buscar(dv, lambda t: t.startswith("estacion") and "punto" in t)
+    if not enc:
+        raise ValueError("No encontré la tabla de estaciones en 'Datos de entrada'.")
+    hr, c0 = enc
+    proy.sistema = str(_texto_derecha(dv, _buscar(dv, lambda t: t == "sistema", hr)) or "").strip()
+    proy.producto = str(_texto_derecha(dv, _buscar(dv, lambda t: t.startswith("fluido"), hr)) or "GM").strip()
+    proy.densidad = _num_derecha(dv, _buscar(dv, lambda t: t.startswith("densidad"), hr), 3) or 0.0
+    proy.viscosidad = _num_derecha(dv, _buscar(dv, lambda t: t.startswith("viscosidad cinem"), hr), 3) or 0.0
+    rug = _num_derecha(dv, _buscar(dv, lambda t: t.startswith("rugosidad") and "( in" in t, hr), 3) or 0.0018
+    for clave, attr in (("fecha", "fecha"), ("responsable", "responsable")):
+        pos = _buscar(dv, lambda t, k=clave: t.startswith(k), hr)
+        if pos:
+            v = dv.get((pos[0] + 1, pos[1])) or _texto_derecha(dv, pos)
+            if isinstance(v, str) and ("elaboraci" in _norm(v) or _norm(v).startswith(("fecha", "responsable"))):
+                v = None                                  # es otra etiqueta, no el valor
+            if v is not None:
+                setattr(proy, attr, v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v))
+    p_ref = next((p for p in proy.productos if _norm(p[0]) == _norm(proy.producto)), None)
+    if p_ref:
+        proy.densidad = proy.densidad or float(p_ref[1])
+        proy.viscosidad = proy.viscosidad or float(p_ref[2])
+
+    col = {}
+    for (r, c), v in dv.items():
+        if r == hr and isinstance(v, str):
+            t = _norm(v)
+            if t.startswith("ubicaci"):
+                col["km"] = c
+            elif t.startswith("caudal despacho"):
+                col["desp"] = c
+            elif t.startswith("presion descarga"):
+                col["desc"] = c
+            elif t.startswith("presion recibo"):
+                col["rec"] = c
+            elif t.replace(" ", "") in ("%dr", "%dra"):
+                col["dr"] = c
+    filas_est = []
+    r = hr + 1
+    while dv.get((r, c0)) not in (None, ""):
+        filas_est.append(r)
+        r += 1
+    despachos = [dv.get((f, col.get("desp"))) for f in filas_est]
+    proy.flujo_kbd = float(despachos[0]) / KBD_A_BPH if despachos and _es_num(despachos[0]) else 0.0
+    for k, f in enumerate(filas_est):
+        rec_f = df_.get((f, col.get("rec")))
+        paso = bool(col.get("desc")) and isinstance(rec_f, str) and \
+            rec_f.replace("$", "").strip().upper() == "=%s%d" % (_letra(col["desc"]), f)
+        dr = dv.get((f, col.get("dr")))
+        est = Estacion(nombre=str(dv[(f, c0)]).strip(),
+                       presion_recibo=_num(dv.get((f, col.get("rec"))), 0) if k > 0 else 0.0,
+                       paso_directo=paso and k > 0, dr=float(dr) if _es_num(dr) else 0.0)
+        if k > 0 and _es_num(despachos[k]) and _es_num(despachos[k - 1]):
+            est.delta_bph = float(despachos[k]) - float(despachos[k - 1])
+        proy.estaciones.append(est)
+
+    # ---------------- perfil continuo -> tramos (según la fila de caudal que usa cada punto)
+    aviso("Leyendo 'Perfil hidráulico'…")
+    cab = _bloque(wb_v[h_per], 8, 40)
+    pos = _buscar(cab, lambda t: t.startswith("abscisa"))
+    if not pos:
+        raise ValueError("No encontré la columna 'Abscisa' en 'Perfil hidráulico'.")
+    hp = pos[0]
+    cp = {}
+    for (r, c), v in cab.items():
+        if r == hp and isinstance(v, str):
+            t = _norm(v)
+            for clave, ini in (("sitio", "sitio"), ("km", "abscisa"), ("altura", "altura"),
+                               ("diam", "diametro externo"), ("esp", "espesor"), ("smys", "smys"),
+                               ("vel", "veloc")):
+                if t.startswith(ini) and clave not in cp:
+                    cp[clave] = c
+    # fila del perfil donde arranca cada tramo: la fórmula de "Presión descarga" de cada estación
+    # apunta a esa fila (p.ej. ='Perfil hidráulico'!X318)
+    inicio_fila = {}
+    for k, f in enumerate(filas_est[:-1]):
+        fo = df_.get((f, col.get("desc"))) if "desc" in col else None
+        m_ = re.search(r"!\$?[A-Z]+\$?(\d+)", fo) if isinstance(fo, str) else None
+        if m_:
+            inicio_fila[k] = int(m_.group(1))
+    patron_q = re.compile(r"\*\s*([0-9]*\.?[0-9]+(?:[Ee]-?\d+)?)\s*\)")
+    factor_bph = 0.00004416
+    if "vel" in cp:
+        for (fo,) in wb_f[h_per].iter_rows(min_row=hp + 1, max_row=hp + 30, min_col=cp["vel"], max_col=cp["vel"],
+                                           values_only=True):
+            mq = patron_q.search(fo) if isinstance(fo, str) else None
+            if mq:
+                factor_bph = float(mq.group(1))
+                break
+    ultima = max(cp.values())
+    filas_perfil = []
+    for i, fila in enumerate(wb_v[h_per].iter_rows(min_row=hp + 1, max_col=ultima, values_only=True)):
+        fila = list(fila) + [None] * (ultima - len(fila))
+
+        def v(clave):
+            return fila[cp[clave] - 1] if clave in cp else None
+        km = v("km")
+        if not _es_num(km):
+            if km is None and filas_perfil:
+                break
+            continue
+        filas_perfil.append((hp + 1 + i, PuntoPerfil(str(v("sitio") or ""), float(km), _num(v("altura")),
+                                                     _num(v("esp")), _num(v("diam")), _num(v("smys")), 0.0)))
+    n_tr = len(filas_est) - 1
+    if len(inicio_fila) == n_tr and n_tr > 0:
+        inicios = [inicio_fila[k] for k in range(n_tr)]
+        inicios[0] = min(inicios[0], filas_perfil[0][0]) if filas_perfil else inicios[0]
+    else:                                           # sin fórmulas: se corta por el km de cada estación
+        kms_est = [_num(dv.get((r_, col.get("km")))) for r_ in filas_est]
+        inicios = [filas_perfil[0][0]] if filas_perfil else []
+        for k in range(1, n_tr):
+            fila_k = next((fr for fr, pt in filas_perfil if pt.km >= kms_est[k] and fr > inicios[-1]), None)
+            if fila_k is None:
+                break
+            iguales = [fr for fr, pt in filas_perfil if abs(pt.km - kms_est[k]) < 1e-9]
+            inicios.append(iguales[-1] if len(iguales) > 1 else fila_k)
+        avisos.append("Los tramos se separaron por el km de cada estación (no se encontraron las fórmulas "
+                      "de presión de descarga).")
+    for k, ini in enumerate(inicios):
+        fin = inicios[k + 1] if k + 1 < len(inicios) else 10 ** 9
+        pts = [pt for fr, pt in filas_perfil if ini <= fr < fin]
+        if not pts:
+            continue
+        t = Tramo(nombre=str(k + 1), rugosidad_in=rug, eficiencia=100.0, dra_siempre=True,
+                  factor_q=factor_bph * KBD_A_BPH, fila_inicio=ini)
+        t.puntos = pts
+        proy.tramos.append(t)
+    if len(proy.tramos) != len(proy.estaciones) - 1:
+        avisos.append(f"Se encontraron {len(proy.tramos)} tramos para {len(proy.estaciones)} estaciones.")
+        proy.estaciones = proy.estaciones[:len(proy.tramos) + 1]
+    km_int = _km_interpolacion(wb_v[h_dat])
+    if km_int:
+        proy.km_interpolar = km_int
+    proy.avisos_importacion = avisos
+    proy.formato_antiguo = False
     return proy
 
 

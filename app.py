@@ -224,53 +224,132 @@ def dialogo_estado():
 # ==========================================================================
 # GRÁFICOS Y TABLAS
 # ==========================================================================
-def figura_perfil(p, res, alto=600):
+COLORES_PERFILES = ["#2CA02C", "#FF7F0E", "#9467BD", "#8C564B", "#E377C2", "#17BECF", "#BCBD22"]
+CURVAS = {"geod": "Presión geodésica", "hid": "Presión int+geod", "maop": "MAOP+geod",
+          "pint": "Presión interna (perfil MOP del simulador)", "barlow": "Presión de diseño Barlow / MAOP",
+          "perfiles": "Perfiles cargados (MOP / transitorios)"}
+
+
+def figura_perfil(p, res, curvas=("geod", "hid", "maop"), verifs=None, alto=620, titulo=None):
+    """Perfil hidráulico. curvas: claves de CURVAS. verifs: verificaciones de perfiles cargados."""
     fig = go.Figure()
-    ss._ley_rot = False
+    total = sum(len(t.puntos) for t in p.tramos)
+    Sc = go.Scattergl if total > 4000 else go.Scatter
+    ya = set()
+    tols = sorted({v["tolerancia_pct"] for v in (verifs or {}).values() if v["tolerancia_pct"] > 0}) \
+        if "perfiles" in curvas else []
+
+    def ley(g):
+        if g in ya:
+            return False
+        ya.add(g)
+        return True
+
     for k, (t, r) in enumerate(zip(p.tramos, res)):
         km = [pt.km for pt in t.puntos]
         txt = [pt.punto for pt in t.puntos]
-        primero = k == 0
-        fig.add_trace(go.Scatter(x=km, y=r.J, name="Presión geodésica (psig)", legendgroup="g", showlegend=primero,
-                                 line=dict(color="#7F6000", width=1.2), fill="tozeroy",
-                                 fillcolor="rgba(217,201,163,0.35)", text=txt,
-                                 hovertemplate="km %{x:.3f}<br>P. geodésica %{y:,.1f} psig<br>%{text}<extra></extra>"))
-        fig.add_trace(go.Scatter(x=km, y=r.N, name="Presión int+geod (psig)", legendgroup="n", showlegend=primero,
-                                 line=dict(color="#2E75B6", width=2.2), customdata=r.O,
-                                 hovertemplate="km %{x:.3f}<br>P. int+geod %{y:,.1f}<br>P. int %{customdata:,.1f} psig"
-                                               "<extra></extra>"))
-        fig.add_trace(go.Scatter(x=km, y=r.Q, name="MAOP+geod (psig)", legendgroup="q", showlegend=primero,
-                                 line=dict(color="#C00000", width=1, dash="dash"), customdata=r.P,
-                                 hovertemplate="km %{x:.3f}<br>MAOP+geod %{y:,.1f}<br>MAOP %{customdata:,.1f} psig"
+        if "geod" in curvas:
+            fig.add_trace(Sc(x=km, y=r.J, name="Presión geodésica (psig)", legendgroup="g", showlegend=ley("g"),
+                             line=dict(color="#7F6000", width=1.2), fill="tozeroy", fillcolor="rgba(217,201,163,0.35)",
+                             text=txt, hovertemplate="km %{x:.3f}<br>P. geodésica %{y:,.1f} psig<br>%{text}"
+                                                     "<extra></extra>"))
+        if "hid" in curvas:
+            fig.add_trace(Sc(x=km, y=r.N, name="Presión int+geod (psig)", legendgroup="n", showlegend=ley("n"),
+                             line=dict(color="#2E75B6", width=2.2), customdata=r.O,
+                             hovertemplate="km %{x:.3f}<br>P. int+geod %{y:,.1f}<br>P. int %{customdata:,.1f} psig"
+                                           "<extra></extra>"))
+        if "maop" in curvas:
+            fig.add_trace(Sc(x=km, y=r.Q, name="MAOP+geod (psig)", legendgroup="q", showlegend=ley("q"),
+                             line=dict(color="#C00000", width=1, dash="dash"), customdata=r.P,
+                             hovertemplate="km %{x:.3f}<br>MAOP+geod %{y:,.1f}<br>MAOP %{customdata:,.1f} psig"
+                                           "<extra></extra>"))
+        if "pint" in curvas:
+            fig.add_trace(Sc(x=km, y=r.O, name="Presión interna - simulador (psig)", legendgroup="o",
+                             showlegend=ley("o"), line=dict(color="#0B3C8C", width=2, dash="dot"), text=txt,
+                             hovertemplate="km %{x:.3f}<br>P. interna %{y:,.1f} psig<br>%{text}<extra></extra>"))
+        if "barlow" in curvas:
+            fig.add_trace(Sc(x=km, y=r.P, name="Presión de diseño Barlow / MAOP (psig)", legendgroup="b",
+                             showlegend=ley("b"), line=dict(color="#FF0000", width=1.6), text=txt,
+                             hovertemplate="km %{x:.3f}<br>P. diseño %{y:,.1f} psig<br>%{text}<extra></extra>"))
+            for tol in tols:
+                fig.add_trace(Sc(x=km, y=[v * (1 + tol / 100) for v in r.P], legendgroup=f"bt{tol:g}",
+                                 name=f"Presión de diseño + {tol:g} % (transitorios)", showlegend=ley(f"bt{tol:g}"),
+                                 line=dict(color="#FF0000", width=1, dash="dot"),
+                                 hovertemplate=f"km %{{x:.3f}}<br>P. diseño + {tol:g} % %{{y:,.1f}} psig"
                                                "<extra></extra>"))
         rot = [j for j, s in enumerate(r.S) if s]
-        if rot and k > 0 and any(any(x.S) for x in res[:k]):
-            ss._ley_rot = True
-        if rot:
-            fig.add_trace(go.Scatter(x=[km[j] for j in rot], y=[r.N[j] for j in rot], mode="markers",
-                                     name="Rotura de tubo", legendgroup="r", showlegend=not ss.get("_ley_rot"),
+        if rot and ("hid" in curvas or "pint" in curvas):
+            ycur = r.N if "hid" in curvas else r.O
+            fig.add_trace(go.Scatter(x=[km[j] for j in rot], y=[ycur[j] for j in rot], mode="markers",
+                                     name="Rotura de tubo", legendgroup="r", showlegend=ley("r"),
                                      marker=dict(symbol="x", size=10, color="red"),
                                      hovertemplate="ROTURA km %{x:.3f}<extra></extra>"))
         des = [j for j, s in enumerate(r.R) if s]
-        if des:
+        if des and "hid" in curvas:
             fig.add_trace(go.Scatter(x=[km[j] for j in des], y=[r.N[j] for j in des], mode="markers",
-                                     name="Descuelgue", legendgroup="d", marker=dict(symbol="triangle-down",
-                                                                                   size=9, color="orange")))
+                                     name="Descuelgue", legendgroup="d", showlegend=ley("d"),
+                                     marker=dict(symbol="triangle-down", size=9, color="orange")))
+    if "perfiles" in curvas:
+        for j, per in enumerate(p.perfiles_externos):
+            color = COLORES_PERFILES[j % len(COLORES_PERFILES)]
+            fig.add_trace(Sc(x=per["km"], y=per["p"], name=f"{per['nombre']} ({per['tipo']})",
+                             line=dict(color=color, width=2, dash="solid" if per["tipo"] == "MOP" else "dashdot"),
+                             hovertemplate=f"{per['nombre']}<br>km %{{x:.3f}}<br>P. interna %{{y:,.1f}} psig"
+                                           "<extra></extra>"))
+            v = (verifs or {}).get(per["nombre"])
+            if v and v["excesos"]:
+                tol = v["tolerancia_pct"]
+                for fuera, col, etq in ((False, "orange", f"dentro del {tol:g} %"), (True, "red", "fuera de tolerancia")):
+                    ex = [z for z in v["excesos"] if (z[5] > tol + 1e-9) == fuera]
+                    if not ex:
+                        continue
+                    fig.add_trace(go.Scatter(
+                        x=[z[0] for z in ex], y=[z[1] for z in ex], mode="markers",
+                        name=f"{per['nombre']}: supera diseño ({etq})",
+                        marker=dict(color=col, size=8, symbol="circle-open", line=dict(width=2)),
+                        customdata=[[z[2], z[4], z[5], z[3]] for z in ex],
+                        hovertemplate=("SUPERA DISEÑO<br>km %{x:.3f}<br>P perfil %{y:,.1f} psig"
+                                       "<br>P diseño %{customdata[0]:,.1f} psig<br>Exceso %{customdata[1]:,.1f} psi"
+                                       " = %{customdata[2]:.2f} %<br>%{customdata[3]}<extra></extra>")))
     kms = m.km_estaciones(p)
     for i, e in enumerate(p.estaciones):
-        if i < len(res):
-            y, txt = res[i].N[0], f"<b>{e.nombre}</b><br>{kms[i]:.2f} km<br>Desc: {res[i].presion_descarga:,.0f}"
+        base = res[i] if i < len(res) else res[-1]
+        if "hid" in curvas:
+            y = base.N[0] if i < len(res) else base.N[-1]
         else:
-            y, txt = res[-1].N[-1], f"<b>{e.nombre}</b><br>{kms[i]:.2f} km<br>Rec: {res[-1].presion_recibo:,.0f}"
+            y = base.O[0] if i < len(res) else base.O[-1]
+        txt = (f"<b>{e.nombre}</b><br>{kms[i]:.2f} km<br>Desc: {res[i].presion_descarga:,.0f}" if i < len(res)
+               else f"<b>{e.nombre}</b><br>{kms[i]:.2f} km<br>Rec: {res[-1].presion_recibo:,.0f}")
         fig.add_vline(x=kms[i], line=dict(color="gray", width=1, dash="dot"))
         fig.add_annotation(x=kms[i], y=y, text=txt, showarrow=False, xanchor="left", yanchor="bottom",
                            font=dict(size=10, color=AZUL), xshift=4, yshift=4)
-    fig.update_layout(height=alto, template="plotly_white", margin=dict(l=60, r=20, t=60, b=110),
-                      title=dict(text=f"Perfil hidráulico - {p.sistema} | {p.producto} | {p.flujo_kbd:,.2f} KBDO",
+    fig.update_layout(height=alto + 40, template="plotly_white", margin=dict(l=60, r=20, t=60, b=170),
+                      title=dict(text=titulo or f"Perfil hidráulico - {p.sistema} | {p.producto} | "
+                                                f"{p.flujo_kbd:,.2f} KBDO",
                                  font=dict(color=AZUL, size=16), x=0.5, xanchor="center"),
-                      xaxis_title="Distancia (km)", yaxis_title="Presión (psi)",
-                      legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center", yanchor="top"))
+                      xaxis_title="Distancia (km)", yaxis_title="Presión (psi)", hovermode="closest",
+                      legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", yanchor="top"))
     return fig
+
+
+def mensaje_verif(nom, v):
+    """Mensaje de verificación de un perfil: máximo % de exceso, km y tolerancia."""
+    if v["n_puntos"] == 0:
+        st.warning(f"⚠️ {nom}: el perfil no coincide con el rango de km del sistema.")
+    elif v["cumple"]:
+        st.success(f"✅ {nom}: no supera la presión de diseño (margen mínimo {-v['max_exceso_psi']:,.1f} psi = "
+                   f"{-v['max_exceso_pct']:.2f} % en km {v['km_max_exceso']:.3f}).")
+    else:
+        txt = (f"{nom}: supera la presión de diseño en {v['n_excesos']} puntos; máximo **{v['max_exceso_pct']:.2f} %** "
+               f"({v['max_exceso_psi']:,.1f} psi) en **km {v['km_max_exceso']:.3f}** — tolerancia {v['tolerancia_pct']:g} %")
+        if v["aceptable"]:
+            st.warning(f"⚠️ {txt}: DENTRO de lo permitido.")
+        else:
+            st.error(f"❌ {txt}: **FUERA** ({v['n_fuera']} puntos superan el {v['tolerancia_pct']:g} %).")
+
+
+def verificaciones(p, res):
+    return {per["nombre"]: m.verificar_perfil(p, res, per) for per in p.perfiles_externos}
 
 
 def celda(valor, clase, ayuda="", dec=2):
@@ -486,7 +565,7 @@ c[0].markdown(f"**Sistema:** <span style='color:{AZUL};font-size:18px;font-weigh
 c[1].text_input("Fecha de elaboración", key="w_fecha", on_change=cb_simple, args=("fecha", "w_fecha"))
 c[2].text_input("Responsable elaboración", key="w_resp", on_change=cb_simple, args=("responsable", "w_resp"))
 
-tabs = st.tabs(["📋 Resumen", "📏 Tramos", "🔧 Actualizar espesores", "📍 Interpolación", "📈 Curva del sistema",
+tabs = st.tabs(["📋 Resumen", "📉 Perfiles MOP / transitorios", "📏 Tramos", "🔧 Actualizar espesores", "📍 Interpolación", "📈 Curva del sistema",
                 "🧪 Productos (REF)", "🕓 Historial", "❓ Ayuda"])
 
 # ================================================================ RESUMEN
@@ -519,6 +598,7 @@ with tabs[0]:
         "%DR": [e.dr if i < n else None for i, e in enumerate(p.estaciones)],
         "FR": [e.fr if i < n else None for i, e in enumerate(p.estaciones)],
         "Inyección": [e.inyeccion if i < n else None for i, e in enumerate(p.estaciones)],
+        "Iny(+)/Entrega(−) bph": [e.delta_bph if 0 < i < n else None for i, e in enumerate(p.estaciones)],
     })
     ed = st.data_editor(
         df_est, key=f"ed_est_{ss.ver}", hide_index=True, use_container_width=True, num_rows="fixed",
@@ -530,6 +610,9 @@ with tabs[0]:
             "%DR": st.column_config.NumberColumn(help=AYUDA["dr"], format="%.4f"),
             "FR": st.column_config.NumberColumn(help=AYUDA["fr"], format="%.4f"),
             "Inyección": st.column_config.SelectboxColumn(options=list(m.INYECCIONES), help=AYUDA["iny"]),
+            "Iny(+)/Entrega(−) bph": st.column_config.NumberColumn(
+                help="Caudal que entra (+) o se entrega al paso (−) en esta estación, en bph. Cambia el flujo de "
+                     "los tramos aguas abajo.", format="%.2f"),
         })
     cambio = False
     for i, e in enumerate(p.estaciones):
@@ -548,6 +631,9 @@ with tabs[0]:
                     cambio = True
             if fila["Inyección"] in m.INYECCIONES and fila["Inyección"] != e.inyeccion:
                 e.inyeccion, cambio = fila["Inyección"], True
+            v = fila["Iny(+)/Entrega(−) bph"]
+            if i > 0 and pd.notna(v) and float(v) != e.delta_bph:
+                e.delta_bph, cambio = float(v), True
     if cambio:
         marcar()
         ss.ver += 1
@@ -559,7 +645,16 @@ with tabs[0]:
     if rot:
         st.error(f"⚠️ {rot} puntos con rotura de tubo. " + ", ".join(
             f"{p.estaciones[i].nombre}: {r.roturas}" for i, r in enumerate(res) if r.roturas))
-    st.plotly_chart(figura_perfil(p, res), use_container_width=True, config={"displaylogo": False})
+    verifs = verificaciones(p, res)
+    opciones = ["geod", "hid", "maop", "pint", "barlow"] + (["perfiles"] if p.perfiles_externos else [])
+    defecto = ["geod", "hid", "maop"] + (["barlow", "perfiles"] if p.perfiles_externos else [])
+    curvas = st.multiselect("Curvas del gráfico", opciones, default=defecto, format_func=lambda k: CURVAS[k],
+                            key=f"curvas_{ss.sistema}_{len(p.perfiles_externos)}",
+                            help="Agregue la Presión interna (perfil MOP) y la Presión de diseño Barlow, o los "
+                                 "perfiles cargados en la pestaña 'Perfiles MOP / transitorios'.")
+    for nom, v in verifs.items():
+        mensaje_verif(nom, v)
+    st.plotly_chart(figura_perfil(p, res, curvas, verifs), use_container_width=True, config={"displaylogo": False})
     if st.button("📄 Preparar resultados en Excel"):
         xl = io.BytesIO()
         m.exportar_resultados_excel(p, res, xl)
@@ -569,10 +664,134 @@ with tabs[0]:
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            on_click=lambda: ss.pop("excel", None))
 
+# ================================================================ PERFILES MOP / TRANSITORIOS
+with tabs[1]:
+    st.markdown("Cargue perfiles de **presión interna** (perfil MOP, transitorios o disparo de válvulas de seguridad "
+                "simulados en SPS) y verifique que estén **por debajo de la presión de diseño (Barlow / MAOP)** del "
+                "sistema. El archivo (Excel o CSV) debe tener una columna de abscisa en km (*Abscisa (Km)*) y una "
+                "de *Presión Interna* en psig. Sirve para cualquier sistema.")
+    st.caption("La presión de diseño es la columna MAOP de las hojas de tramo (0,72·2·SMYS·t/D, o el rating de la "
+               "válvula cuando existe); en las plantillas nuevas es la 'Presión de diseño Barlow'.")
+    subidos = st.file_uploader("Perfiles de presión (.xlsx / .csv)", type=["xlsx", "xlsm", "csv", "txt"],
+                               accept_multiple_files=True, key=f"perfiles_{ss.ver}")
+    nuevos = []
+    for f in subidos or []:
+        try:
+            nuevos.append(m.leer_perfil_presion((f.name, f.getvalue())))
+        except Exception as ex:  # noqa: BLE001
+            st.error(f"❌ {f.name}: {ex}")
+    if nuevos:
+        for j, per in enumerate(nuevos):
+            c1, c2, c3 = st.columns([3, 2, 3])
+            per["nombre"] = c1.text_input("Nombre del perfil", value=per["nombre"], key=f"np_{j}_{ss.ver}")
+            per["tipo"] = c2.selectbox("Tipo", m.TIPOS_PERFIL, index=m.TIPOS_PERFIL.index(per["tipo"]),
+                                       key=f"tp_{j}_{ss.ver}")
+            c3.caption(f"{per['archivo']}: {len(per['km'])} puntos, km {per['km'][0]:.3f} a {per['km'][-1]:.3f}, "
+                       f"presión {min(per['p']):,.0f} a {max(per['p']):,.0f} psig")
+        if st.button("➕ Agregar al sistema", type="primary"):
+            existentes = {x["nombre"]: k for k, x in enumerate(p.perfiles_externos)}
+            for per in nuevos:
+                if per["nombre"] in existentes:
+                    p.perfiles_externos[existentes[per["nombre"]]] = per
+                else:
+                    p.perfiles_externos.append(per)
+                ss.cambios.append(("Perfiles", None, f"Perfil {per['tipo']}", "", per["nombre"],
+                                   f"Cargado de {per['archivo']}"))
+            marcar()
+            ss.ver += 1
+            st.rerun()
+
+    if not p.perfiles_externos:
+        st.info("Este sistema todavía no tiene perfiles cargados.")
+    else:
+        st.caption("Exceso % = (P perfil − P diseño) / P diseño × 100. **Tolerancia**: % que se permite superar la "
+                   "presión de diseño (por defecto 10 % en transitorios según API, 0 % en MOP). Puede cambiar el "
+                   "tipo y la tolerancia de cada perfil en la tabla.")
+        verifs = verificaciones(p, res)
+        filas_e = pd.DataFrame([{"Perfil": per["nombre"], "Tipo": per["tipo"],
+                                 "Tolerancia (%)": float(m.tolerancia_perfil(per))} for per in p.perfiles_externos])
+        ed = st.data_editor(filas_e, hide_index=True, use_container_width=True, key=f"tolp_{ss.sistema}_{ss.ver}",
+                            disabled=["Perfil"],
+                            column_config={"Tipo": st.column_config.SelectboxColumn(options=list(m.TIPOS_PERFIL)),
+                                           "Tolerancia (%)": st.column_config.NumberColumn(min_value=0.0, step=1.0,
+                                                                                           format="%.1f")})
+        cambio = False
+        for per, (_, fila) in zip(p.perfiles_externos, ed.iterrows()):
+            if fila["Tipo"] != per["tipo"]:
+                per["tipo"] = fila["Tipo"]
+                per.pop("tolerancia_pct", None)
+                cambio = True
+            elif abs(float(fila["Tolerancia (%)"] or 0) - m.tolerancia_perfil(per)) > 1e-9:
+                per["tolerancia_pct"] = max(0.0, float(fila["Tolerancia (%)"] or 0))
+                cambio = True
+        if cambio:
+            marcar()
+            ss.ver += 1
+            st.rerun()
+
+        filas_v = []
+        for per in p.perfiles_externos:
+            v = verifs[per["nombre"]]
+            res_txt = ("✅ " if v["cumple"] else ("⚠️ " if v["aceptable"] else "❌ ")) + v["resultado"]
+            filas_v.append({"Perfil": per["nombre"], "Tipo": per["tipo"], "Tolerancia (%)": v["tolerancia_pct"],
+                            "Resultado": res_txt, "Puntos que superan": v["n_excesos"],
+                            "Fuera de tolerancia": v["n_fuera"], "Máx. exceso (%)": v["max_exceso_pct"],
+                            "Máx. exceso (psi)": v["max_exceso_psi"], "en km": v["km_max_exceso"],
+                            "P. perfil (psig)": v["p_en_max"], "P. diseño (psig)": v["diseno_en_max"],
+                            "Archivo": per["archivo"], "Cargado": per.get("fecha_carga", "")})
+        st.dataframe(pd.DataFrame(filas_v).style.format(precision=2, na_rep="")
+                     .format({"en km": "{:.3f}", "Tolerancia (%)": "{:g}"}, na_rep=""),
+                     use_container_width=True, hide_index=True)
+        for per in p.perfiles_externos:
+            mensaje_verif(per["nombre"], verifs[per["nombre"]])
+        ver_sim = st.toggle("Mostrar también la presión interna del simulador (perfil MOP calculado)", value=True)
+        st.plotly_chart(figura_perfil(p, res, ["barlow", "perfiles"] + (["pint"] if ver_sim else []), verifs,
+                                      titulo=f"Perfiles de presión interna vs presión de diseño - {p.sistema}"),
+                        use_container_width=True, config={"displaylogo": False})
+        sel = st.selectbox("Detalle del perfil", [x["nombre"] for x in p.perfiles_externos])
+        v = verifs[sel]
+        if v["excesos"]:
+            st.markdown("**Tramos de km donde se supera la presión de diseño**")
+            dfr = pd.DataFrame([{"km desde": r["km_ini"], "km hasta": r["km_fin"], "Puntos": r["n"],
+                                 "Máx. exceso (%)": r["max_pct"], "en km": r["km_max"],
+                                 "Máx. exceso (psi)": r["max_psi"],
+                                 "Estado": "❌ Fuera de tolerancia" if r["fuera"] else "⚠️ Dentro de tolerancia"}
+                                for r in v["rangos"]])
+            st.dataframe(dfr.style.format({"km desde": "{:.3f}", "km hasta": "{:.3f}", "en km": "{:.3f}",
+                                           "Máx. exceso (%)": "{:.2f}", "Máx. exceso (psi)": "{:,.2f}"}),
+                         use_container_width=True, hide_index=True, height=min(400, 40 + 35 * len(dfr)))
+            st.markdown("**Puntos que superan la presión de diseño**")
+            solo_fuera = st.checkbox("Mostrar solo los puntos fuera de tolerancia", value=False)
+            ex = [z for z in v["excesos"] if not solo_fuera or z[5] > v["tolerancia_pct"] + 1e-9]
+            dfx = pd.DataFrame([{"km": z[0], "P. perfil (psig)": z[1], "P. diseño (psig)": z[2],
+                                 "Exceso (psi)": z[4], "Exceso (%)": z[5], "Estado": z[6], "Punto": z[3]}
+                                for z in ex], columns=["km", "P. perfil (psig)", "P. diseño (psig)",
+                                                       "Exceso (psi)", "Exceso (%)", "Estado", "Punto"])
+            st.dataframe(dfx.style.format({"km": "{:.3f}", "P. perfil (psig)": "{:,.2f}",
+                                           "P. diseño (psig)": "{:,.2f}", "Exceso (psi)": "{:,.2f}",
+                                           "Exceso (%)": "{:.2f}"}),
+                         use_container_width=True, hide_index=True, height=320)
+        else:
+            st.success("Ningún punto supera la presión de diseño.")
+        dft = pd.DataFrame([{"km": z[0], "P perfil (psig)": z[1], "P diseño (psig)": z[2], "Exceso (psi)": z[4],
+                             "Exceso (%)": z[5], "Estado": z[6], "Punto": z[3]} for z in v["puntos"]])
+        st.download_button("⬇️ Descargar verificación completa (CSV)",
+                           dft.to_csv(sep=";", index=False, decimal=",").encode("utf-8-sig"),
+                           file_name=f"verificacion_{sel}.csv")
+        with st.expander("🗑️ Quitar perfiles"):
+            quitar = st.multiselect("Perfiles a quitar", [x["nombre"] for x in p.perfiles_externos])
+            if quitar and st.button("Quitar seleccionados"):
+                p.perfiles_externos = [x for x in p.perfiles_externos if x["nombre"] not in quitar]
+                for nmb in quitar:
+                    ss.cambios.append(("Perfiles", None, "Perfil quitado", nmb, "", ""))
+                marcar()
+                st.rerun()
+        st.caption("Los perfiles quedan guardados con el sistema al presionar 💾 Guardar.")
+
 # ================================================================ TRAMOS
 COLS_EDIT = {"Punto/ubicación": "punto", "dist.del reg. [km]": "km", "altura [m]": "altura", "esp. [in]": "espesor",
              "diám. ext. [in]": "diam_ext", "SMYS [PSI]": "smys", "Rating de Válvula (psi)": "rating"}
-with tabs[1]:
+with tabs[2]:
     nombres_tr = [f"Tramo {t.nombre}: {p.estaciones[i].nombre} → {p.estaciones[i + 1].nombre}"
                   for i, t in enumerate(p.tramos)]
     it = st.radio("Tramo", range(len(p.tramos)), format_func=lambda k: nombres_tr[k], horizontal=True,
@@ -593,7 +812,8 @@ with tabs[1]:
     o = st.columns([1, 1, 1.4, 1, 3])
     rug = o[0].number_input("✏️ Rugosidad interna (in)", value=float(t.rugosidad_in), format="%.5f", min_value=0.0,
                             key=f"rug_{it}_{ss.ver}")
-    eff = o[1].number_input("✏️ Eficiencia de la tubería (%)", value=float(t.eficiencia), min_value=1.0,
+    eff = o[1].number_input("✏️ Eficiencia de la tubería (%)", value=min(max(float(t.eficiencia), 1.0), 200.0),
+                            min_value=1.0,
                             max_value=200.0, key=f"eff_{it}_{ss.ver}")
     if rug != t.rugosidad_in or eff != t.eficiencia:
         t.rugosidad_in, t.eficiencia = rug, eff
@@ -667,7 +887,7 @@ with tabs[1]:
                     st.error("El tramo debe tener al menos 2 puntos con km.")
 
 # ================================================================ ESPESORES
-with tabs[2]:
+with tabs[3]:
     st.markdown("Asigne el espesor medido en una nueva inspección a un rango de km. Si los km no existen en el "
                 "perfil se crean los puntos (altura interpolada) y el cambio de espesor en escalón, igual que en "
                 "la plantilla. Los cambios quedan pendientes hasta **Guardar** y se registran en el Historial.")
@@ -716,7 +936,7 @@ with tabs[2]:
                      use_container_width=True, hide_index=True)
 
 # ================================================================ INTERPOLACIÓN
-with tabs[3]:
+with tabs[4]:
     st.text_input("Distancias del registro a interpolar (km, separadas por ; o espacio)", key="w_km")
     try:
         p.km_interpolar = [float(x.replace(",", ".")) for x in ss.w_km.replace(";", " ").split()]
@@ -736,10 +956,11 @@ with tabs[3]:
     st.dataframe(dfi.style.format(precision=2, na_rep=""), use_container_width=True, hide_index=True)
 
 # ================================================================ CURVA DEL SISTEMA
-with tabs[4]:
+with tabs[5]:
     k = st.columns(4)
     li = k[0].number_input("Flujo mínimo (KBDO)", value=0.0, min_value=0.0)
-    ls = k[1].number_input("Flujo máximo (KBDO)", value=round(p.flujo_kbd * 1.25, 1), min_value=0.1)
+    ls = k[1].number_input("Flujo máximo (KBDO)", value=max(round(p.flujo_kbd * 1.25, 1), 100.0 if p.flujo_kbd <= 0
+                                                            else 0.1), min_value=0.1)
     pasos = k[2].number_input("Puntos", value=10, min_value=2, max_value=50)
     modo = k[3].selectbox("%DR en la curva", ["Sin DRA (%DR = 0)", "%DR actual de cada tramo"])
     st.caption("Con %DR mayor que 100 la fricción queda negativa y la presión de descarga baja al aumentar el "
@@ -755,7 +976,7 @@ with tabs[4]:
     st.dataframe(dfc.style.format(precision=2), use_container_width=True, hide_index=True)
 
 # ================================================================ PRODUCTOS
-with tabs[5]:
+with tabs[6]:
     st.caption("Tabla común a todos los sistemas (hoja REF). Se guarda con 💾 Guardar.")
     dfp = pd.DataFrame(p.productos, columns=["Producto", "Densidad Kg/m3", "Viscosidad cSt 1", "Temp 1 °F",
                                              "Densidad2 Kg/m3", "Viscosidad2 cSt", "Temp 2 °F"])
@@ -769,7 +990,7 @@ with tabs[5]:
         st.rerun()
 
 # ================================================================ HISTORIAL
-with tabs[6]:
+with tabs[7]:
     hist = pd.DataFrame(db.historial(p.sistema), columns=["Fecha", "Usuario", "Tramo / estación", "km", "Campo",
                                                           "Valor anterior", "Valor nuevo", "Nota"])
     st.dataframe(hist, use_container_width=True, hide_index=True, height=600)
@@ -777,7 +998,7 @@ with tabs[6]:
                        file_name=f"historial_{p.sistema}.csv")
 
 # ================================================================ AYUDA
-with tabs[7]:
+with tabs[8]:
     st.markdown("""
 **Cómo usar el simulador**
 
@@ -788,9 +1009,13 @@ with tabs[7]:
 3. **🎯 Buscar objetivo** (barra lateral): igual que en Excel — *Definir la celda*, *Con el valor*, *Para cambiar
    la celda*. Ejemplos: Presión descarga SEBASTOPOL = 1900 cambiando %DR; cambiando Flujo (bph) para ajustar el
    KBDO; Rotura de tubo = 0 cambiando la Presión de recibo de la estación siguiente (máxima presión sin roturas).
-4. **Tramos**: perfil completo de cada tramo. Las columnas ✏️ se pueden editar o pegar desde Excel.
-5. **Actualizar espesores**: por rango de km o con un archivo de rangos de una inspección.
-6. **💾 Guardar**: guarda en la base de datos compartida y registra los cambios en el **Historial**. Si otro
+4. **Perfiles MOP / transitorios**: suba los perfiles de presión interna (MOP, transitorios o disparo de válvulas de
+   seguridad de SPS) y el programa calcula, punto a punto, cuánto superan la presión de diseño (psi y %), el máximo y
+   los km donde ocurre; en transitorios se permite hasta el 10 % (editable). En el gráfico del
+   Resumen puede agregar la Presión interna, la Presión de diseño y los perfiles cargados.
+5. **Tramos**: perfil completo de cada tramo. Las columnas ✏️ se pueden editar o pegar desde Excel.
+6. **Actualizar espesores**: por rango de km o con un archivo de rangos de una inspección.
+7. **💾 Guardar**: guarda en la base de datos compartida y registra los cambios en el **Historial**. Si otro
    usuario guardó el mismo sistema mientras usted trabajaba, el programa le avisa.
-7. **Importar plantillas Excel** (barra lateral): suba una o varias plantillas .xlsm para agregar sistemas.
+8. **Importar plantillas Excel** (barra lateral): suba una o varias plantillas .xlsm para agregar sistemas.
 """)
