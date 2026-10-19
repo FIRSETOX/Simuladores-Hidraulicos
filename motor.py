@@ -433,24 +433,29 @@ def interpolar(proy: Proyecto, resultados, km):
     return interpolar_lista(proy, resultados, [km])[0]
 
 
-def curva_sistema(proy: Proyecto, lim_inf, lim_sup, pasos=10, dr_forzado=None):
+def curva_sistema(proy: Proyecto, lim_inf, lim_sup, pasos=10, dr_forzado=None, cadena=""):
     """Macro CurvaSistema: presión de descarga de cada estación para flujos entre límites.
 
     dr_forzado: si no es None, se usa ese %DR en todos los tramos (p.ej. 0 = sin DRA).
+    cadena: "" = línea principal (flujo = caudal que entra al sistema, con el reparto actual de los
+        ramales); nombre de un ramal = curva propia del ramal (flujo = caudal que entra al ramal en su
+        nodo; presión de descarga en el nodo hacia el ramal y en cada estación del ramal).
     """
-    originales = [e.dr for e in proy.estaciones]
+    sistema = proy if not cadena else subred_ramal(proy, cadena)
+    estaciones = list(sistema.estaciones) + [e for r in sistema.ramales for e in r.estaciones]
+    originales = [e.dr for e in estaciones]
     try:
         if dr_forzado is not None:
-            for e in proy.estaciones:
+            for e in estaciones:
                 e.dr = dr_forzado
         filas = []
         for k in range(pasos + 1):
             q = lim_inf + (lim_sup - lim_inf) * k / pasos
-            res = calcular_proyecto(proy, flujo_kbd=q)
+            res = calcular_proyecto(sistema, flujo_kbd=q)
             filas.append((q, [r.presion_descarga for r in res]))
         return filas
     finally:
-        for e, dr in zip(proy.estaciones, originales):
+        for e, dr in zip(estaciones, originales):
             e.dr = dr
 
 
@@ -1530,6 +1535,43 @@ def posiciones_esquema(p):
         pendientes.remove(r)
     return pos
 
+
+def subred_ramal(proy: Proyecto, nombre):
+    """El ramal (y los ramales que salen de él) como un sistema propio alimentado en su nodo: sirve para la
+    curva del sistema del ramal. Comparte estaciones y tramos con el sistema (salvo la del nodo)."""
+    ram = cadena_de(proy, nombre)
+    if ram is None or ram is proy:
+        raise ValueError(f"No existe el ramal {nombre}.")
+    nodo = replace(ram.estaciones[0], inyeccion="Sin inyección", delta_bph=0.0, paso_directo=False)
+    desc, frontera = [], [ram.nombre]
+    while frontera:
+        hijos = [r for r in proy.ramales if r.padre in frontera]
+        desc += hijos
+        frontera = [h.nombre for h in hijos]
+    subs = [replace(h, padre="" if h.padre == ram.nombre else h.padre) for h in desc]
+    return Proyecto(sistema=f"{proy.sistema} – {ram.nombre}", flujo_kbd=proy.flujo_kbd, producto=proy.producto,
+                    densidad=proy.densidad, viscosidad=proy.viscosidad, iny1_bph=proy.iny1_bph,
+                    iny2_bph=proy.iny2_bph, estaciones=[nodo] + list(ram.estaciones[1:]), tramos=ram.tramos,
+                    productos=proy.productos, ramales=subs)
+
+
+def nombres_curva(proy: Proyecto, cadena=""):
+    """Nombres de las estaciones (series) de la curva del sistema de una línea o ramal."""
+    cad = proy if not cadena else cadena_de(proy, cadena)
+    n = len(cad.tramos)
+    nombres = [e.nombre for e in cad.estaciones[:n]]
+    if cadena and nombres:
+        nombres[0] = f"{nombres[0]} (hacia {cadena})"
+    return nombres
+
+
+def flujo_operacion(proy: Proyecto, res, cadena=""):
+    """Caudal de operación actual de la línea (entrada al sistema) o del ramal (lo que entra en su nodo)."""
+    if not cadena:
+        return proy.flujo_kbd
+    inf = (getattr(res, "red", None) or {}).get(cadena)
+    return inf["flujo"] if inf else None
+
 # --------------------------------------------------------------------------
 # Importación desde la plantilla Excel
 # --------------------------------------------------------------------------
@@ -2281,8 +2323,9 @@ def diferencias(viejo: Proyecto, nuevo: Proyecto):
 # ==========================================================================
 # Exportación a Excel
 # ==========================================================================
-def exportar_resultados_excel(proy, res, ruta, curva=None):
-    """ruta: nombre de archivo o io.BytesIO (descarga desde la web)."""
+def exportar_resultados_excel(proy, res, ruta, curva=None, curva_nombres=None, curva_titulo=None):
+    """ruta: nombre de archivo o io.BytesIO (descarga desde la web).
+    curva_nombres / curva_titulo: series de la curva del sistema (p.ej. la curva de un ramal)."""
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
@@ -2420,9 +2463,13 @@ def exportar_resultados_excel(proy, res, ruta, curva=None):
 
     if curva:
         wc = wb.create_sheet("Curva del sistema")
-        nombres = [e.nombre for e in proy.estaciones[:len(proy.tramos)]]
-        encabezado(wc, 1, ["KBDO"] + [f"P. desc. {n} (psig)" for n in nombres])
-        for i, (q, ps) in enumerate(curva, 2):
+        nombres = curva_nombres or [e.nombre for e in proy.estaciones[:len(proy.tramos)]]
+        if curva_titulo:
+            wc.insert_rows(1)
+        encabezado(wc, 2 if curva_titulo else 1, ["KBDO"] + [f"P. desc. {n} (psig)" for n in nombres])
+        if curva_titulo:
+            wc.cell(1, 1, curva_titulo).font = Font(bold=True)
+        for i, (q, ps) in enumerate(curva, 3 if curva_titulo else 2):
             wc.cell(i, 1, q)
             for j, v in enumerate(ps, 2):
                 wc.cell(i, j, v)

@@ -21,7 +21,8 @@ import motor as m
 # (Streamlit no siempre recarga los módulos importados al actualizar el repositorio), se recarga aquí.
 REQUERIDOS_MOTOR = ("presion_minima_recibo", "tolerancia_perfil", "verificar_perfil", "leer_perfil_presion",
                     "buscar_objetivo", "importar_plantilla_excel", "simular_fuga", "calcular_red", "proyecto_ruta",
-                    "rutas_red", "Ramal", "posiciones_esquema")
+                    "rutas_red", "Ramal", "posiciones_esquema", "subred_ramal",
+                    "nombres_curva", "flujo_operacion")
 
 
 def _motor_incompleto():
@@ -125,7 +126,7 @@ def marcar():
     ss.modificado = True
 
 
-VERSION_CODIGO = "2026-10-20a"
+VERSION_CODIGO = "2026-10-20b"
 
 
 def motor_desactualizado():
@@ -1089,16 +1090,16 @@ with tab_red:
             ep, er = inf["estrangula_padre"], inf["estrangula_ramal"]
             filas.append({"Ramal": nom, "Sale de": f"{nombre_cadena(p, ram.padre)} – {nodo_nom}", "Modo": ram.modo,
                           "% del flujo": inf["pct_calculado"], "Flujo ramal (KBDO)": inf["flujo"],
-                          "Flujo que sigue (KBDO)": "—" if inf["flujo_padre_despues"] is None else inf["flujo_padre_despues"],
+                          "Flujo que sigue (KBDO)": float("nan") if inf["flujo_padre_despues"] is None else inf["flujo_padre_despues"],
                           "Presión en el nodo (psig)": inf["p_nodo"],
-                          "P. que pide la línea (psig)": "— (fin de línea)" if inf["d_padre"] is None else inf["d_padre"],
+                          "P. que pide la línea (psig)": float("nan") if inf["d_padre"] is None else inf["d_padre"],
                           "P. que pide el ramal (psig)": inf["d_ramal"],
                           "Válvula de control": ("—" if ram.modo == "Hidráulico" else
                                                  (f"estrangula {er:,.1f} psi en el ramal" if (er or 0) > 0.05 else
                                                   (f"estrangula {ep:,.1f} psi en la línea" if (ep or 0) > 0.05 else "—"))),
                           "Nodo": "bombea (cabezal)" if inf.get("nodo_bombea") else "bypass (sin bombeo)",
                           "Nota": inf.get("nota", "")})
-        st.dataframe(pd.DataFrame(filas).style.format(precision=2, na_rep=""), use_container_width=True,
+        st.dataframe(pd.DataFrame(filas).style.format(precision=2, na_rep="—"), use_container_width=True,
                      hide_index=True)
         st.caption("**Porcentaje**: la presión del nodo es la mayor que piden las ramas; la otra rama la reduce con "
                    "su válvula de control (estrangula). **Hidráulico**: sin válvula, la presión en el nodo es la "
@@ -1711,21 +1712,36 @@ with tabs[4]:
 
 # ================================================================ CURVA DEL SISTEMA
 with tabs[5]:
+    lineas_c = [""] + [r.nombre for r in p.ramales]
+    if p.ramales:
+        lin_c = st.radio("Curva de", lineas_c, horizontal=True, key=f"curva_lin_{ss.sistema}",
+                         format_func=lambda x: "Línea principal (flujo que entra al sistema)" if not x
+                         else f"Ramal {x} (flujo que entra al ramal en su nodo)")
+    else:
+        lin_c = ""
+    q_op = m.flujo_operacion(p, res, lin_c) or 0.0
     k = st.columns(4)
-    li = k[0].number_input("Flujo mínimo (KBDO)", value=0.0, min_value=0.0)
-    ls = k[1].number_input("Flujo máximo (KBDO)", value=max(round(p.flujo_kbd * 1.25, 1), 100.0 if p.flujo_kbd <= 0
-                                                            else 0.1), min_value=0.1)
+    li = k[0].number_input("Flujo mínimo (KBDO)", value=0.0, min_value=0.0, key=f"c_li_{lin_c}")
+    ls = k[1].number_input("Flujo máximo (KBDO)", value=max(round(q_op * 1.25, 1), 100.0 if q_op <= 0 else 0.1),
+                           min_value=0.1, key=f"c_ls_{ss.sistema}_{lin_c}")
     pasos = k[2].number_input("Puntos", value=10, min_value=2, max_value=50)
     modo = k[3].selectbox("%DR en la curva", ["Sin DRA (%DR = 0)", "%DR actual de cada tramo"])
     st.caption("Con %DR mayor que 100 la fricción queda negativa y la presión de descarga baja al aumentar el "
-               "caudal; por eso la curva se calcula por defecto sin DRA.")
-    curva = m.curva_sistema(p, li, ls, int(pasos), 0.0 if modo.startswith("Sin") else None)
-    nombres_e = [e.nombre for e in p.estaciones[:len(p.tramos)]]
+               "caudal; por eso la curva se calcula por defecto sin DRA."
+               + (" Con ramales, la curva de la línea principal usa el reparto actual (% o hidráulico); la de un "
+                  "ramal es su curva propia: caudal que entra al ramal vs. presión de descarga en el nodo hacia el "
+                  "ramal y en sus estaciones (lo que deben dar las bombas que lo alimentan)." if p.ramales else ""))
+    if lin_c and any(not t.puntos for t in m.cadena_de(p, lin_c).tramos):
+        st.warning("Este ramal tiene tramos sin perfil: la curva solo es válida cuando todos tienen datos.")
+    curva = m.curva_sistema(p, li, ls, int(pasos), 0.0 if modo.startswith("Sin") else None, lin_c)
+    nombres_e = m.nombres_curva(p, lin_c)
     dfc = pd.DataFrame([[q] + ps for q, ps in curva], columns=["KBDO"] + nombres_e)
     figc = go.Figure([go.Scatter(x=dfc["KBDO"], y=dfc[nm], name=nm, mode="lines+markers") for nm in nombres_e])
-    figc.add_vline(x=p.flujo_kbd, line=dict(dash="dash", color="gray"), annotation_text="Operación")
-    figc.update_layout(template="plotly_white", height=480, xaxis_title="Flujo (KBDO)",
-                       yaxis_title="Presión de descarga (psig)", title=f"Curva del sistema - {p.sistema} ({modo})")
+    figc.add_vline(x=q_op, line=dict(dash="dash", color="gray"), annotation_text=f"Operación {q_op:,.2f} KBDO")
+    titulo_c = p.sistema if not lin_c else f"{p.sistema} – ramal {lin_c}"
+    figc.update_layout(template="plotly_white", height=480,
+                       xaxis_title="Flujo del ramal (KBDO)" if lin_c else "Flujo (KBDO)",
+                       yaxis_title="Presión de descarga (psig)", title=f"Curva del sistema - {titulo_c} ({modo})")
     st.plotly_chart(figc, use_container_width=True, config={"displaylogo": False})
     st.dataframe(dfc.style.format(precision=2), use_container_width=True, hide_index=True)
 
