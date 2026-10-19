@@ -1572,6 +1572,53 @@ def flujo_operacion(proy: Proyecto, res, cadena=""):
     inf = (getattr(res, "red", None) or {}).get(cadena)
     return inf["flujo"] if inf else None
 
+
+def curva_entre_estaciones(proy: Proyecto, cadena, ini, fin, lim_inf, lim_sup, pasos=10, dr_forzado=None,
+                           recibo_fin=None, sin_bombeo_intermedio=True):
+    """Curva del sistema de un trayecto: de la estación 'ini' a la estación 'fin' de una línea o ramal.
+
+    Para cada caudal Q (el que sale de 'ini') calcula la presión de descarga necesaria en 'ini' para llegar
+    a 'fin' con la presión de recibo 'recibo_fin' (por defecto la actual de 'fin').
+    sin_bombeo_intermedio=True: las estaciones intermedias no bombean (el trayecto es una sola tubería);
+        False: se dejan como están (las que bombean fijan su presión de recibo).
+    Se respetan las inyecciones/entregas de las estaciones intermedias; no se incluyen los ramales que
+    salgan de ellas. Devuelve (filas, nombres): filas = [(Q, [descarga de cada estación del trayecto])]."""
+    cad = proy if not cadena else cadena_de(proy, cadena)
+    if cad is None:
+        raise ValueError("No se encontró la línea o ramal.")
+    n = len(cad.tramos)
+    if not (0 <= ini < fin <= n):
+        raise ValueError("La estación final debe estar después de la inicial.")
+    est = [replace(e) for e in cad.estaciones[ini:fin + 1]]
+    est[0].inyeccion, est[0].delta_bph = "Sin inyección", 0.0
+    for k, e in enumerate(est):
+        if 0 < k < len(est) - 1 and sin_bombeo_intermedio:
+            e.paso_directo = True
+        if dr_forzado is not None:
+            e.dr = dr_forzado
+    est[-1].paso_directo = False
+    if recibo_fin is not None:
+        est[-1].presion_recibo = recibo_fin
+    sub = Proyecto(sistema=f"{proy.sistema} – {est[0].nombre} a {est[-1].nombre}", producto=proy.producto,
+                   densidad=proy.densidad, viscosidad=proy.viscosidad, iny1_bph=proy.iny1_bph,
+                   iny2_bph=proy.iny2_bph, estaciones=est, tramos=cad.tramos[ini:fin], productos=proy.productos)
+    nombres = [e.nombre for e in est[:-1]]
+    if sin_bombeo_intermedio:
+        nombres = nombres[:1]
+    filas = []
+    for k in range(pasos + 1):
+        q = lim_inf + (lim_sup - lim_inf) * k / pasos
+        res = calcular_proyecto(sub, flujo_kbd=q)
+        ps = [r.presion_descarga for r in res]
+        filas.append((q, ps[:len(nombres)]))
+    return filas, nombres
+
+
+def flujo_en_estacion(proy: Proyecto, res, cadena, ini):
+    """Caudal de operación que sale de la estación 'ini' de una línea o ramal."""
+    rs = list(res) if not cadena else list(((getattr(res, "red", None) or {}).get(cadena) or {}).get("res", []))
+    return rs[ini].flujo_kbd if ini < len(rs) else None
+
 # --------------------------------------------------------------------------
 # Importación desde la plantilla Excel
 # --------------------------------------------------------------------------

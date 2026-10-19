@@ -22,7 +22,8 @@ import motor as m
 REQUERIDOS_MOTOR = ("presion_minima_recibo", "tolerancia_perfil", "verificar_perfil", "leer_perfil_presion",
                     "buscar_objetivo", "importar_plantilla_excel", "simular_fuga", "calcular_red", "proyecto_ruta",
                     "rutas_red", "Ramal", "posiciones_esquema", "subred_ramal",
-                    "nombres_curva", "flujo_operacion")
+                    "nombres_curva", "flujo_operacion", "curva_entre_estaciones",
+                    "flujo_en_estacion")
 
 
 def _motor_incompleto():
@@ -126,7 +127,7 @@ def marcar():
     ss.modificado = True
 
 
-VERSION_CODIGO = "2026-10-20b"
+VERSION_CODIGO = "2026-10-20c"
 
 
 def motor_desactualizado():
@@ -1713,34 +1714,72 @@ with tabs[4]:
 # ================================================================ CURVA DEL SISTEMA
 with tabs[5]:
     lineas_c = [""] + [r.nombre for r in p.ramales]
-    if p.ramales:
-        lin_c = st.radio("Curva de", lineas_c, horizontal=True, key=f"curva_lin_{ss.sistema}",
-                         format_func=lambda x: "Línea principal (flujo que entra al sistema)" if not x
-                         else f"Ramal {x} (flujo que entra al ramal en su nodo)")
+    tipo_c = st.radio("Tipo de curva", ["Línea o ramal completo", "Entre dos estaciones"], horizontal=True,
+                      key=f"curva_tipo_{ss.sistema}",
+                      help="Entre dos estaciones: presión de descarga necesaria en la estación inicial para llevar "
+                           "el caudal hasta la estación final con su presión de recibo (p.ej. Sutamarchán → Miraflores).")
+    if p.ramales or tipo_c.startswith("Entre"):
+        lin_c = st.radio("Línea", lineas_c, horizontal=True, key=f"curva_lin_{ss.sistema}",
+                         format_func=lambda x: "Línea principal" + ("" if tipo_c.startswith("Entre")
+                                                                    else " (flujo que entra al sistema)") if not x
+                         else f"Ramal {x}" + ("" if tipo_c.startswith("Entre") else " (flujo que entra al ramal en su nodo)"))
     else:
         lin_c = ""
-    q_op = m.flujo_operacion(p, res, lin_c) or 0.0
+    cad_c = m.cadena_de(p, lin_c)
+    entre = tipo_c.startswith("Entre")
+    if entre:
+        nom_est = [e.nombre for e in cad_c.estaciones]
+        if lin_c and nom_est:
+            nom_est[0] = f"{nom_est[0]} (nodo)"
+        e1, e2, e3, e4 = st.columns([1.5, 1.5, 1.2, 1.6])
+        ini_c = e1.selectbox("Desde la estación", range(len(nom_est) - 1), format_func=lambda k: nom_est[k],
+                             key=f"c_ini_{ss.sistema}_{lin_c}")
+        fin_ops = list(range(ini_c + 1, len(nom_est)))
+        fin_c = e2.selectbox("Hasta la estación", fin_ops, format_func=lambda k: nom_est[k],
+                             key=f"c_fin_{ss.sistema}_{lin_c}_{ini_c}")
+        rs_c = list(res) if not lin_c else list((getattr(res, "red", None) or {}).get(lin_c, {}).get("res", []))
+        rec_act = rs_c[fin_c - 1].presion_recibo if fin_c - 1 < len(rs_c) else cad_c.estaciones[fin_c].presion_recibo
+        rec_c = e3.number_input(f"Recibo en {cad_c.estaciones[fin_c].nombre} (psig)", value=float(round(rec_act, 2)),
+                                step=10.0, key=f"c_rec_{ss.sistema}_{lin_c}_{fin_c}")
+        sin_bomb = e4.checkbox("Sin bombeo en las estaciones intermedias", value=True,
+                               key=f"c_sb_{ss.sistema}_{lin_c}", disabled=fin_c - ini_c < 2,
+                               help="Marcado: el trayecto se toma como una sola tubería (las estaciones intermedias no "
+                                    "bombean). Sin marcar: las que bombean fijan su presión de recibo y se muestra la "
+                                    "descarga de cada una.")
+        q_op = m.flujo_en_estacion(p, res, lin_c, ini_c) or 0.0
+    else:
+        q_op = m.flujo_operacion(p, res, lin_c) or 0.0
     k = st.columns(4)
-    li = k[0].number_input("Flujo mínimo (KBDO)", value=0.0, min_value=0.0, key=f"c_li_{lin_c}")
+    clave_c = f"{ss.sistema}_{lin_c}_{entre}_{ini_c if entre else ''}"
+    li = k[0].number_input("Flujo mínimo (KBDO)", value=0.0, min_value=0.0, key=f"c_li_{clave_c}")
     ls = k[1].number_input("Flujo máximo (KBDO)", value=max(round(q_op * 1.25, 1), 100.0 if q_op <= 0 else 0.1),
-                           min_value=0.1, key=f"c_ls_{ss.sistema}_{lin_c}")
+                           min_value=0.1, key=f"c_ls_{clave_c}")
     pasos = k[2].number_input("Puntos", value=10, min_value=2, max_value=50)
     modo = k[3].selectbox("%DR en la curva", ["Sin DRA (%DR = 0)", "%DR actual de cada tramo"])
     st.caption("Con %DR mayor que 100 la fricción queda negativa y la presión de descarga baja al aumentar el "
                "caudal; por eso la curva se calcula por defecto sin DRA."
                + (" Con ramales, la curva de la línea principal usa el reparto actual (% o hidráulico); la de un "
                   "ramal es su curva propia: caudal que entra al ramal vs. presión de descarga en el nodo hacia el "
-                  "ramal y en sus estaciones (lo que deben dar las bombas que lo alimentan)." if p.ramales else ""))
-    if lin_c and any(not t.puntos for t in m.cadena_de(p, lin_c).tramos):
-        st.warning("Este ramal tiene tramos sin perfil: la curva solo es válida cuando todos tienen datos.")
-    curva = m.curva_sistema(p, li, ls, int(pasos), 0.0 if modo.startswith("Sin") else None, lin_c)
-    nombres_e = m.nombres_curva(p, lin_c)
+                  "ramal y en sus estaciones (lo que deben dar las bombas que lo alimentan)." if p.ramales and not entre else "")
+               + (" Entre dos estaciones se respetan las entregas/inyecciones intermedias; no se incluyen los ramales "
+                  "que salgan de ellas." if entre else ""))
+    tramos_c = cad_c.tramos[ini_c:fin_c] if entre else cad_c.tramos
+    if any(not t.puntos for t in tramos_c):
+        st.warning("Hay tramos sin perfil: la curva solo es válida cuando todos tienen datos.")
+    dr_c = 0.0 if modo.startswith("Sin") else None
+    if entre:
+        curva, nombres_e = m.curva_entre_estaciones(p, lin_c, ini_c, fin_c, li, ls, int(pasos), dr_c, rec_c, sin_bomb)
+        titulo_c = f"{cad_c.estaciones[ini_c].nombre} → {cad_c.estaciones[fin_c].nombre} (recibo {rec_c:,.0f} psig)"
+    else:
+        curva = m.curva_sistema(p, li, ls, int(pasos), dr_c, lin_c)
+        nombres_e = m.nombres_curva(p, lin_c)
+        titulo_c = p.sistema if not lin_c else f"{p.sistema} – ramal {lin_c}"
     dfc = pd.DataFrame([[q] + ps for q, ps in curva], columns=["KBDO"] + nombres_e)
-    figc = go.Figure([go.Scatter(x=dfc["KBDO"], y=dfc[nm], name=nm, mode="lines+markers") for nm in nombres_e])
+    figc = go.Figure([go.Scatter(x=dfc["KBDO"], y=dfc[nm], name=f"Descarga {nm}", mode="lines+markers")
+                      for nm in nombres_e])
     figc.add_vline(x=q_op, line=dict(dash="dash", color="gray"), annotation_text=f"Operación {q_op:,.2f} KBDO")
-    titulo_c = p.sistema if not lin_c else f"{p.sistema} – ramal {lin_c}"
     figc.update_layout(template="plotly_white", height=480,
-                       xaxis_title="Flujo del ramal (KBDO)" if lin_c else "Flujo (KBDO)",
+                       xaxis_title="Flujo del ramal (KBDO)" if (lin_c and not entre) else "Flujo (KBDO)",
                        yaxis_title="Presión de descarga (psig)", title=f"Curva del sistema - {titulo_c} ({modo})")
     st.plotly_chart(figc, use_container_width=True, config={"displaylogo": False})
     st.dataframe(dfc.style.format(precision=2), use_container_width=True, hide_index=True)
