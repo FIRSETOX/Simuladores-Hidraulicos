@@ -20,15 +20,16 @@ import motor as m
 # Funciones del motor que necesita esta versión de app.py. Si el servidor tiene cargado un motor.py viejo
 # (Streamlit no siempre recarga los módulos importados al actualizar el repositorio), se recarga aquí.
 REQUERIDOS_MOTOR = ("presion_minima_recibo", "tolerancia_perfil", "verificar_perfil", "leer_perfil_presion",
-                    "buscar_objetivo", "importar_plantilla_excel")
+                    "buscar_objetivo", "importar_plantilla_excel", "simular_fuga", "calcular_red", "proyecto_ruta",
+                    "rutas_red", "Ramal", "posiciones_esquema")
 
 
 def _motor_incompleto():
     faltan = [f for f in REQUERIDOS_MOTOR if not hasattr(m, f)]
     campos_est = {f.name for f in dataclasses.fields(m.Estacion)}
     campos_proy = {f.name for f in dataclasses.fields(m.Proyecto)}
-    faltan += [c for c in ("delta_bph",) if c not in campos_est]
-    faltan += [c for c in ("perfiles_externos", "margen_descuelgue_psi") if c not in campos_proy]
+    faltan += [c for c in ("delta_bph", "clientes") if c not in campos_est]
+    faltan += [c for c in ("perfiles_externos", "margen_descuelgue_psi", "ramales") if c not in campos_proy]
     return faltan
 
 
@@ -124,7 +125,7 @@ def marcar():
     ss.modificado = True
 
 
-VERSION_CODIGO = "2026-10-19d"
+VERSION_CODIGO = "2026-10-20a"
 
 
 def motor_desactualizado():
@@ -498,7 +499,7 @@ def html_resumen(p, res):
     """Hoja Resumen con la misma estructura y colores de la plantilla Excel."""
     n = len(p.tramos)
     kms = m.km_estaciones(p)
-    fl = m.flujos_por_tramo(p)
+    fl = [r.flujo_kbd for r in res]
     h = ['<table class="xl">']
     h.append("<tr>" + celda("Flujo (KBDO)", "lbl") + celda(p.flujo_kbd, "in", AYUDA["flujo"], 4)
              + celda(p.flujo_kbd * m.KBD_A_BPH, "in", AYUDA["bph"]) + celda("bph", "lbl")
@@ -707,8 +708,249 @@ c[0].markdown(f"**Sistema:** <span style='color:{AZUL};font-size:18px;font-weigh
 c[1].text_input("Fecha de elaboración", key="w_fecha", on_change=cb_simple, args=("fecha", "w_fecha"))
 c[2].text_input("Responsable elaboración", key="w_resp", on_change=cb_simple, args=("responsable", "w_resp"))
 
-tabs = st.tabs(["📋 Resumen", "📉 Perfiles MOP / transitorios", "📏 Tramos", "🔧 Actualizar espesores", "📍 Interpolación", "📈 Curva del sistema",
-                "🧪 Productos (REF)", "🕓 Historial", "❓ Ayuda"])
+# ==========================================================================
+# RED / RAMALES  y  FUGAS: funciones de la interfaz
+# ==========================================================================
+COLORES_RAMAL = ["#2E75B6", "#C55A11", "#548235", "#7030A0", "#BF8F00", "#00838F", "#AD1457"]
+
+
+def nombre_cadena(p, cad):
+    return "Línea principal" if not cad else f"Ramal {cad}"
+
+
+def opciones_nodos(p):
+    """Estaciones donde puede salir un ramal: [(cadena, índice, etiqueta)]."""
+    ops = [("", i, f"Línea principal – {e.nombre}") for i, e in enumerate(p.estaciones)]
+    for r in p.ramales:
+        ops += [(r.nombre, i, f"Ramal {r.nombre} – {e.nombre}") for i, e in enumerate(r.estaciones) if i > 0]
+    return ops
+
+
+def posiciones_red(p):
+    return m.posiciones_esquema(p)
+
+
+def figura_esquema(p, res, nodo_sel=None, fuga=None):
+    """Esquema de la red (estaciones, tramos, ramales, % de flujo y clientes)."""
+    pos = posiciones_red(p)
+    red = getattr(res, "red", None) or {}
+    fig = go.Figure()
+    cadenas = [("", p, list(res), 0)] + [(r.nombre, r, list(red[r.nombre]["res"]) if r.nombre in red else [], k + 1)
+                                          for k, r in enumerate(p.ramales)]
+    xs_all, ys_all = [0.0], [0.0]
+    marcadores = []
+    for nom, cad, rs, k in cadenas:
+        color = AZUL if not nom else COLORES_RAMAL[(k - 1) % len(COLORES_RAMAL)]
+        for i, t in enumerate(cad.tramos):
+            a, b = pos.get((nom, i)), pos.get((nom, i + 1))
+            if a is None or b is None:
+                continue
+            xs, ys = ([a[0], a[0], b[0]], [a[1], b[1], b[1]]) if (nom and i == 0 and a[1] != b[1]) else \
+                ([a[0], b[0]], [a[1], b[1]])
+            q = rs[i].flujo_kbd if i < len(rs) else None
+            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color=color, width=4),
+                                     hoverinfo="text", showlegend=False,
+                                     text=f"Tramo {t.nombre}" + (f"<br>{q:,.2f} KBDO" if q is not None else "")))
+            fig.add_annotation(x=b[0] - 0.12, y=b[1], ax=xs[-2], ay=ys[-2], xref="x", yref="y", axref="x", ayref="y",
+                               showarrow=True, arrowhead=3, arrowsize=1.4, arrowwidth=2, arrowcolor=color, text="")
+            xm = (xs[-2] + xs[-1]) / 2
+            fig.add_annotation(x=xm, y=b[1] + 0.17, showarrow=False, font=dict(size=12, color=color),
+                               text=f"<b>{html.escape(str(t.nombre))}</b>" + (f"<br>{q:,.1f} KBDO" if q is not None else ""))
+        if nom and nom in red:
+            inf = red[nom]
+            a = pos.get((nom, 0))
+            b = pos.get((nom, 1))
+            if a and b:
+                etiqueta = f"{inf['pct_calculado']:.1f} %" + (" (hidráulico)" if cad.modo == "Hidráulico" else "")
+                fig.add_annotation(x=a[0] + 0.05, y=(a[1] + b[1]) / 2, showarrow=False, xanchor="left",
+                                   font=dict(size=12, color=color), text=f"<b>{etiqueta}</b>",
+                                   bgcolor="rgba(255,255,255,0.85)")
+        xs, ys, txt, cd, simb = [], [], [], [], []
+        for i, e in enumerate(cad.estaciones):
+            if nom and i == 0:
+                continue                                       # el nodo ya está dibujado por su padre
+            x, y = pos.get((nom, i), (None, None))
+            if x is None:
+                continue
+            xs.append(x)
+            ys.append(y)
+            xs_all.append(x)
+            ys_all.append(y)
+            sale = [r.nombre for r in p.ramales if (r.padre or "") == nom and r.nodo == i]
+            info = f"<b>{html.escape(e.nombre)}</b><br>{nombre_cadena(p, nom)}"
+            if i > 0 and i - 1 < len(rs):
+                info += f"<br>Recibo {rs[i - 1].presion_recibo:,.1f} psig"
+            if i < len(rs):
+                info += f"<br>Descarga {rs[i].presion_descarga:,.1f} psig"
+            for rn in sale:
+                if rn in red:
+                    info += f"<br>→ {html.escape(rn)}: {red[rn]['flujo']:,.2f} KBDO, P nodo {red[rn]['p_nodo'] or 0:,.1f}"
+            txt.append(info)
+            cd.append(f"{nom}|{i}")
+            simb.append("circle-x" if (e.paso_directo and 0 < i < len(cad.tramos)) else "circle")
+            # clientes (entregas)
+            clientes = [c.strip() for c in (getattr(e, "clientes", "") or "").split(",") if c.strip()]
+            arriba = (y == 0.0)                     # línea principal: clientes arriba; ramales: abajo
+            for k2, cli in enumerate(clientes):
+                cx, cy = x + 0.35, (y + 0.42 + 0.22 * k2) if arriba else (y - 0.32 - 0.22 * k2)
+                fig.add_trace(go.Scatter(x=[x, x, cx], y=[y, cy, cy], mode="lines", showlegend=False,
+                                         line=dict(color="#2E75B6", width=1.5, dash="dot"), hoverinfo="skip"))
+                fig.add_trace(go.Scatter(x=[cx + 0.06], y=[cy], mode="markers+text", showlegend=False,
+                                         marker=dict(symbol="pentagon", size=16, color="#FFE600",
+                                                     line=dict(color="#2E75B6", width=1.5)),
+                                         text=[f"  {html.escape(cli)}"], textposition="middle right",
+                                         textfont=dict(size=11, color="#1F3864"), hoverinfo="skip"))
+                xs_all.append(cx + 1.0)
+                ys_all.append(cy)
+        tamanos = [26 if nodo_sel == c else 20 for c in cd]
+        marcadores.append(go.Scatter(
+            x=xs, y=ys, mode="markers+text", text=[t.split("<br>")[0] for t in txt], textposition="bottom center",
+            textfont=dict(size=12, color="#1F3864"), hovertext=txt, hoverinfo="text", customdata=cd,
+            marker=dict(symbol=simb, size=tamanos, color="#1F3864",
+                        line=dict(color=["#FF0000" if nodo_sel == c else "white" for c in cd], width=3)),
+            selected=dict(marker=dict(opacity=1)), unselected=dict(marker=dict(opacity=1)),
+            showlegend=False))
+    for tr_ in marcadores:                      # estaciones encima de las líneas (para poder hacer clic)
+        fig.add_trace(tr_)
+    fig.update_traces(unselected=dict(marker=dict(opacity=1), textfont=dict(color="#1F3864")),
+                      selected=dict(marker=dict(opacity=1)), selector=dict(type="scatter"))
+    if fuga:
+        fig.add_trace(go.Scatter(x=[fuga[0]], y=[fuga[1]], mode="markers+text", showlegend=False,
+                                 marker=dict(symbol="star", size=18, color="red"), text=["Fuga"],
+                                 textposition="top center"))
+    alto = 230 + 120 * max(0, -min(ys_all)) + 110 * max(0, max(ys_all))
+    fig.update_layout(height=alto, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                      xaxis=dict(visible=False, range=[min(xs_all) - 0.5, max(xs_all) + 0.9]),
+                      yaxis=dict(visible=False, range=[min(ys_all) - 0.7, max(ys_all) + 0.6]), dragmode=False,
+                      clickmode="event+select")
+    return fig
+
+
+def cargar_otro_sistema(origen):
+    """origen: ('excel', archivo subido) o ('bd', nombre)."""
+    if origen[0] == "excel":
+        return m.importar_plantilla_excel(origen[1].getvalue())
+    return bd().cargar(origen[1])
+
+
+def desplazar_km(ramal, delta):
+    for t in ramal.tramos:
+        for pt in t.puntos:
+            pt.km += delta
+
+
+def km_nodo(p, cadena, nodo):
+    cad = m.cadena_de(p, cadena)
+    if cad is None or not cad.tramos:
+        return 0.0
+    if nodo == 0:
+        return cad.tramos[0].puntos[0].km if cad.tramos[0].puntos else 0.0
+    t = cad.tramos[min(nodo, len(cad.tramos)) - 1]
+    return max((pt.km for pt in t.puntos), default=0.0)
+
+
+def tabla_estaciones_cadena(p, nom_cadena, cad, rs):
+    """Resultados por estación de una cadena (línea principal o ramal)."""
+    pr = p if not nom_cadena else m.proyecto_ramal(p, cad, rs[0].flujo_kbd if rs else 0.0)
+    kms = m.km_estaciones(pr)
+    try:
+        mins = m.presion_minima_recibo(pr, rs)
+    except Exception:  # noqa: BLE001
+        mins = []
+    filas = []
+    for i, e in enumerate(cad.estaciones):
+        r = rs[i] if i < len(rs) else None
+        d = mins[i - 1] if 0 < i <= len(mins) else {}
+        filas.append({"Estación": e.nombre, "km": kms[i] if i < len(kms) else None,
+                      "Presión recibo (psig)": rs[i - 1].presion_recibo if 0 < i <= len(rs) else None,
+                      "Presión descarga (psig)": r.presion_descarga if r else None,
+                      "Flujo (KBDO)": r.flujo_kbd if r else None, "Rotura de tubo": r.roturas if r else None,
+                      "Descuelgue": r.descuelgues if r else None, "Lleno de línea (kbls)": r.lleno_kbls if r else None,
+                      "P. mín. recibo sin descuelgue (psig)": d.get("p_min"), "Holgura recibo (psi)": d.get("holgura"),
+                      "Bypass": "Sí" if e.paso_directo else ""})
+    return pd.DataFrame(filas)
+
+
+def editor_perfil_tramo(t, r, clave):
+    """Editor de los puntos de un tramo (pegar desde Excel). Devuelve True si cambió."""
+    df = pd.DataFrame({
+        "Punto/ubicación": [x.punto for x in t.puntos], "km": [x.km for x in t.puntos],
+        "altura [m]": [x.altura for x in t.puntos], "esp. [in]": [x.espesor for x in t.puntos],
+        "diám. ext. [in]": [x.diam_ext for x in t.puntos], "SMYS [PSI]": [x.smys for x in t.puntos],
+        "Rating válvula (psi)": [x.rating or None for x in t.puntos]},
+        columns=["Punto/ubicación", "km", "altura [m]", "esp. [in]", "diám. ext. [in]", "SMYS [PSI]",
+                 "Rating válvula (psi)"])
+    if r is not None and r.N and len(r.N) == len(t.puntos):
+        df["Presión int (psig)"] = r.O
+        df["MAOP (psig)"] = r.P
+        df["Rotura"] = r.S
+    cfg = {"km": st.column_config.NumberColumn(format="%.6f", required=True),
+           "esp. [in]": st.column_config.NumberColumn(format="%.4f", min_value=0.0),
+           "altura [m]": st.column_config.NumberColumn(format="%.3f"),
+           "diám. ext. [in]": st.column_config.NumberColumn(format="%.3f", min_value=0.0),
+           "SMYS [PSI]": st.column_config.NumberColumn(format="%.0f"),
+           "Rating válvula (psi)": st.column_config.NumberColumn(format="%.0f", help="Vacío = MAOP por espesor"),
+           "Presión int (psig)": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+           "MAOP (psig)": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+           "Rotura": st.column_config.CheckboxColumn(disabled=True)}
+    ed = st.data_editor(df, key=clave, column_config=cfg, num_rows="dynamic", height=420, use_container_width=True)
+    est = ss.get(clave, {})
+    if not (est.get("edited_rows") or est.get("added_rows") or est.get("deleted_rows")):
+        return False
+    nuevos = []
+    for _, f in ed.iterrows():
+        if pd.isna(f["km"]):
+            continue
+
+        def num(col, defecto=0.0):
+            v = f[col]
+            return defecto if pd.isna(v) else float(v)
+        nuevos.append(m.PuntoPerfil("" if pd.isna(f["Punto/ubicación"]) else str(f["Punto/ubicación"]),
+                                    num("km"), num("altura [m]"), num("esp. [in]"), num("diám. ext. [in]"),
+                                    num("SMYS [PSI]"), num("Rating válvula (psi)")))
+    nuevos.sort(key=lambda x: x.km)
+    if len(nuevos) >= 2 or not nuevos:
+        t.puntos = nuevos
+        return True
+    st.error("El tramo debe tener al menos 2 puntos con km.")
+    return False
+
+
+def figura_fuga(f, curvas=("geod", "hid", "maop")):
+    """Perfil con la fuga (línea azul) y sin la fuga (gris punteado)."""
+    pf, rf = f["proy_fuga"], f["res_fuga"]
+    p = ss.proy
+    if f["cadena"]:
+        cam = next((c for n_, c in m.rutas_red(pf) if c and c[-1].nombre == f["cadena"]), [])
+        pr, rr = m.proyecto_ruta(pf, rf, cam)
+        camb = next((c for n_, c in m.rutas_red(p) if c and c[-1].nombre == f["cadena"]), [])
+        pb, rb = m.proyecto_ruta(p, f["res_base"], camb)
+    else:
+        pr, rr = pf, list(rf)
+        pb, rb = p, list(f["res_base"])
+    fig = figura_perfil(pr, rr, curvas, titulo=f"Perfil con fuga en km {f['km']:.3f} – {f['q_bph']:,.0f} bph")
+    for k, (t, r) in enumerate(zip(pb.tramos, rb)):
+        fig.add_trace(go.Scatter(x=[x.km for x in t.puntos], y=r.N, mode="lines", name="Presión int+geod SIN fuga",
+                                 legendgroup="sf", showlegend=(k == 0),
+                                 line=dict(color="gray", width=1.5, dash="dot"), hoverinfo="skip"))
+    # punto de la fuga
+    alt = None
+    for t, r in zip(pr.tramos, rr):
+        for x, n_ in zip(t.puntos, r.N):
+            if abs(x.km - f["km"]) < 1e-6:
+                alt = n_
+                break
+    fig.add_trace(go.Scatter(x=[f["km"]], y=[alt], mode="markers+text", name="Fuga",
+                             marker=dict(symbol="star", size=18, color="red"), text=[f"Fuga {f['q_bph']:,.0f} bph"],
+                             textposition="top center"))
+    return fig
+
+
+_tabs = st.tabs(["📋 Resumen", "🔀 Red / ramales", "💧 Fugas / válvula ilícita", "📉 Perfiles MOP / transitorios",
+                 "📏 Tramos", "🔧 Actualizar espesores", "📍 Interpolación", "📈 Curva del sistema",
+                 "🧪 Productos (REF)", "🕓 Historial", "❓ Ayuda"])
+tabs = [_tabs[0]] + list(_tabs[3:])
+tab_red, tab_fuga = _tabs[1], _tabs[2]
 
 # ================================================================ RESUMEN
 with tabs[0]:
@@ -782,6 +1024,11 @@ with tabs[0]:
         st.rerun()
 
     st.markdown("##### 📋 Hoja Resumen")
+    if getattr(res, "red", None):
+        st.info("🔀 Este sistema tiene ramales: " + "; ".join(
+            f"**{nom}** se lleva {inf['flujo']:,.2f} KBDO ({inf['pct_calculado']:.1f} %) en "
+            f"{m.cadena_de(p, inf['ramal'].padre).estaciones[inf['ramal'].nodo].nombre}"
+            for nom, inf in res.red.items()) + ". La tabla muestra la línea principal; vea la pestaña *Red / ramales*.")
     st.markdown(html_resumen(p, res), unsafe_allow_html=True)
     rot = sum(r.roturas for r in res)
     if rot:
@@ -806,6 +1053,370 @@ with tabs[0]:
         st.download_button("⬇️ Descargar resultados en Excel", ss.excel, file_name=f"resultados_{p.sistema}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            on_click=lambda: ss.pop("excel", None))
+
+# ================================================================ RED / RAMALES
+with tab_red:
+    st.markdown("Esquema del sistema. **Haga clic en una estación** para agregar un ramal que salga de ahí "
+                "(derivación del flujo), o elíjala en la lista. Los ramales pueden repartir el flujo con un "
+                "**% fijo** (válvula de control) o por **hidráulica** (el % lo dan las presiones de recibo de "
+                "cada destino).")
+    nodo_sel = ss.get(f"nodo_sel_{ss.sistema}")
+    ev = st.plotly_chart(figura_esquema(p, res, nodo_sel), use_container_width=True, on_select="rerun",
+                         selection_mode="points", key=f"esq_{ss.sistema}_{ss.ver}",
+                         config={"displaylogo": False, "displayModeBar": False})
+    try:
+        pts_sel = ev.selection.points if ev and ev.selection else []
+    except AttributeError:
+        pts_sel = []
+    if pts_sel and pts_sel[0].get("customdata"):
+        nuevo_sel = pts_sel[0]["customdata"]
+        if isinstance(nuevo_sel, list):
+            nuevo_sel = nuevo_sel[0]
+        if nuevo_sel != nodo_sel:
+            ss[f"nodo_sel_{ss.sistema}"] = nuevo_sel
+            st.rerun()
+    st.caption("● estación con bombeo  ⊗ estación en bypass / punto de conexión  ⬟ entrega a cliente "
+               "(columna *Clientes* de las estaciones)  — el % sobre cada ramal es la fracción del flujo que se deriva.")
+
+    red = getattr(res, "red", None) or {}
+    if red:
+        st.markdown("##### 🔀 Nodos de derivación")
+        filas = []
+        for nom, inf in red.items():
+            ram = inf["ramal"]
+            padre = m.cadena_de(p, ram.padre)
+            nodo_nom = padre.estaciones[ram.nodo].nombre if padre is not None and ram.nodo < len(padre.estaciones) else ""
+            ep, er = inf["estrangula_padre"], inf["estrangula_ramal"]
+            filas.append({"Ramal": nom, "Sale de": f"{nombre_cadena(p, ram.padre)} – {nodo_nom}", "Modo": ram.modo,
+                          "% del flujo": inf["pct_calculado"], "Flujo ramal (KBDO)": inf["flujo"],
+                          "Flujo que sigue (KBDO)": "—" if inf["flujo_padre_despues"] is None else inf["flujo_padre_despues"],
+                          "Presión en el nodo (psig)": inf["p_nodo"],
+                          "P. que pide la línea (psig)": "— (fin de línea)" if inf["d_padre"] is None else inf["d_padre"],
+                          "P. que pide el ramal (psig)": inf["d_ramal"],
+                          "Válvula de control": ("—" if ram.modo == "Hidráulico" else
+                                                 (f"estrangula {er:,.1f} psi en el ramal" if (er or 0) > 0.05 else
+                                                  (f"estrangula {ep:,.1f} psi en la línea" if (ep or 0) > 0.05 else "—"))),
+                          "Nodo": "bombea (cabezal)" if inf.get("nodo_bombea") else "bypass (sin bombeo)",
+                          "Nota": inf.get("nota", "")})
+        st.dataframe(pd.DataFrame(filas).style.format(precision=2, na_rep=""), use_container_width=True,
+                     hide_index=True)
+        st.caption("**Porcentaje**: la presión del nodo es la mayor que piden las ramas; la otra rama la reduce con "
+                   "su válvula de control (estrangula). **Hidráulico**: sin válvula, la presión en el nodo es la "
+                   "misma para las dos ramas y el % sale de las presiones de recibo de cada destino. Si la estación "
+                   "del nodo está en bypass, esa presión es la que debe llegar desde aguas arriba.")
+
+    # ---------------- agregar ramal
+    ops = opciones_nodos(p)
+    etiquetas = [o[2] for o in ops]
+    idx_def = 0
+    if nodo_sel:
+        cad_s, i_s = nodo_sel.split("|")
+        for k, o in enumerate(ops):
+            if o[0] == cad_s and o[1] == int(i_s):
+                idx_def = k
+    with st.expander("➕ Agregar ramal / tramos nuevos", expanded=bool(nodo_sel) or not p.ramales):
+        a1, a2, a3, a4 = st.columns([2.2, 2, 1.4, 1])
+        k_nodo = a1.selectbox("Sale de la estación", range(len(ops)), index=idx_def,
+                              format_func=lambda k: etiquetas[k], key=f"nr_nodo_{ss.sistema}_{nodo_sel}")
+        nom_r = a2.text_input("Nombre del ramal", value=f"Ramal {len(p.ramales) + 1}", key=f"nr_nom_{ss.sistema}")
+        modo_r = a3.radio("Reparto del flujo", m.MODOS_RAMAL, key=f"nr_modo_{ss.sistema}",
+                          help="Porcentaje: el ramal se lleva un % fijo del flujo que llega al nodo. Hidráulico: "
+                               "el % se calcula con las presiones de recibo de cada destino.")
+        pct_r = a4.number_input("% del flujo", 0.0, 100.0, 50.0, step=5.0, key=f"nr_pct_{ss.sistema}",
+                                disabled=modo_r == "Hidráulico")
+        origen = st.radio("Datos de los tramos nuevos", ["Importar la plantilla Excel del ramal",
+                                                         "Copiar de otro sistema guardado",
+                                                         "Crear vacío y pegar los perfiles"],
+                          horizontal=True, key=f"nr_origen_{ss.sistema}")
+        otro = None
+        if origen.startswith("Importar"):
+            arch = st.file_uploader("Plantilla del ramal (.xlsm / .xlsx)", type=["xlsm", "xlsx"],
+                                    key=f"nr_xl_{ss.sistema}_{ss.ver}")
+            if arch is not None:
+                try:
+                    otro = cargar_otro_sistema(("excel", arch))
+                except Exception as ex:  # noqa: BLE001
+                    st.error(f"No se pudo leer la plantilla: {ex}")
+        elif origen.startswith("Copiar"):
+            otros = [x for x in bd().sistemas() if x != ss.sistema]
+            if otros:
+                sel_o = st.selectbox("Sistema", otros, key=f"nr_bd_{ss.sistema}")
+                otro = cargar_otro_sistema(("bd", sel_o))
+            else:
+                st.info("No hay otros sistemas en la base de datos.")
+        else:
+            nombres_txt = st.text_area("Estaciones del ramal en orden (una por línea, sin la estación del nodo)",
+                                       "MIRAFLORES\nPORVENIR\nMONTERREY\nAPIAY\nSAN FERNANDO",
+                                       key=f"nr_txt_{ss.sistema}", height=140)
+        cad_n, i_n, _ = ops[k_nodo]
+        kmn = km_nodo(p, cad_n, i_n)
+        if otro is not None:
+            nombres_o = [e.nombre for e in otro.estaciones]
+            nodo_nombre = m.cadena_de(p, cad_n).estaciones[i_n].nombre
+            ini_def = next((k for k, x in enumerate(nombres_o[:-1]) if x.strip().upper() == nodo_nombre.strip().upper()), 0)
+            b1, b2 = st.columns([2, 3])
+            ini = b1.selectbox("Tomar los tramos a partir de la estación", range(len(nombres_o) - 1), index=ini_def,
+                               format_func=lambda k: nombres_o[k], key=f"nr_ini_{ss.sistema}",
+                               help="Si la plantilla trae toda la línea (p.ej. desde Sebastopol), elija la estación "
+                                    "donde empieza el ramal.")
+            km0 = otro.tramos[ini].puntos[0].km if otro.tramos[ini].puntos else 0.0
+            b2.caption(f"{otro.sistema}: {len(otro.tramos) - ini} tramos desde {nombres_o[ini]} (km {km0:,.3f}) hasta "
+                       f"{nombres_o[-1]}. Producto {otro.producto}; se usará el producto de este sistema.")
+            desplazar = st.checkbox(f"Desplazar los km del ramal para que continúe desde el nodo (km {kmn:,.3f})",
+                                    value=abs(km0 - kmn) > 0.5, key=f"nr_desp_{ss.sistema}")
+        if st.button("➕ Agregar ramal", type="primary", key=f"nr_btn_{ss.sistema}"):
+            nombre_ok = nom_r.strip()
+            if not nombre_ok or any(r.nombre == nombre_ok for r in p.ramales):
+                st.error("Use un nombre de ramal que no exista.")
+            elif otro is None and not origen.startswith("Crear"):
+                st.error("Primero cargue la plantilla o elija el sistema.")
+            else:
+                if otro is not None:
+                    sub = m.Proyecto(estaciones=otro.estaciones[ini:], tramos=otro.tramos[ini:])
+                    nuevo = m.nuevo_ramal_desde_proyecto(p, sub, nombre_ok, cad_n, i_n, modo_r, pct_r)
+                    if desplazar:
+                        desplazar_km(nuevo, kmn - km0)
+                else:
+                    nombres_l = [x.strip() for x in nombres_txt.splitlines() if x.strip()]
+                    nuevo = m.nuevo_ramal_vacio(p, nombre_ok, cad_n, i_n, nombres_l, modo_r, pct_r)
+                p.ramales.append(nuevo)
+                ss.cambios.append((f"Ramal {nombre_ok}", None, "Ramal agregado", "",
+                                   f"desde {etiquetas[k_nodo]}, {len(nuevo.tramos)} tramos", ""))
+                ss.pop(f"nodo_sel_{ss.sistema}", None)
+                marcar()
+                ss.ver += 1
+                st.rerun()
+
+    # ---------------- editar ramales
+    if p.ramales:
+        st.markdown("##### ✏️ Ramales")
+        nombres_r = [r.nombre for r in p.ramales]
+        rsel = st.selectbox("Ramal", nombres_r, key=f"ram_sel_{ss.sistema}")
+        ram = p.ramales[nombres_r.index(rsel)]
+        inf = red.get(ram.nombre, {})
+        rs_r = list(inf.get("res", []))
+        c1, c2, c3, c4 = st.columns([1.4, 1, 1.6, 1])
+        modo_n = c1.radio("Reparto", m.MODOS_RAMAL, index=m.MODOS_RAMAL.index(ram.modo) if ram.modo in m.MODOS_RAMAL else 0,
+                          horizontal=True, key=f"ram_modo_{rsel}_{ss.ver}")
+        pct_n = c2.number_input("% del flujo", 0.0, 100.0, float(ram.pct), step=1.0, key=f"ram_pct_{rsel}_{ss.ver}",
+                                disabled=modo_n == "Hidráulico")
+        c3.metric("Flujo del ramal", f"{inf.get('flujo', 0):,.2f} KBDO",
+                  f"{inf.get('pct_calculado', 0):.2f} % del flujo en el nodo", delta_color="off")
+        if modo_n != ram.modo or abs(pct_n - ram.pct) > 1e-12:
+            ram.modo, ram.pct = modo_n, pct_n
+            marcar()
+            ss.ver += 1
+            st.rerun()
+        if c4.button("🗑️ Quitar ramal", key=f"ram_del_{rsel}"):
+            hijos = [r.nombre for r in p.ramales if r.padre == ram.nombre]
+            if hijos:
+                st.error(f"Primero quite los ramales que salen de este: {', '.join(hijos)}")
+            else:
+                p.ramales.remove(ram)
+                ss.cambios.append((f"Ramal {rsel}", None, "Ramal quitado", rsel, "", ""))
+                marcar()
+                ss.ver += 1
+                st.rerun()
+        if inf.get("nota"):
+            st.warning(inf["nota"])
+        st.markdown("**Estaciones del ramal** (la primera es el nodo de derivación: su %DR y FR aplican al primer "
+                    "tramo del ramal)")
+        n_r = len(ram.tramos)
+        df_e = pd.DataFrame({
+            "Estación": [e.nombre for e in ram.estaciones],
+            "Presión recibo (psig)": [None if i == 0 else e.presion_recibo for i, e in enumerate(ram.estaciones)],
+            "Bypass": [bool(e.paso_directo) for e in ram.estaciones],
+            "%DR": [e.dr if i < n_r else None for i, e in enumerate(ram.estaciones)],
+            "FR": [e.fr if i < n_r else None for i, e in enumerate(ram.estaciones)],
+            "Iny(+)/Entrega(−) bph": [e.delta_bph if 0 < i < n_r else None for i, e in enumerate(ram.estaciones)],
+            "Clientes (entregas)": [e.clientes for e in ram.estaciones]})
+        ed_e = st.data_editor(df_e, key=f"ram_est_{rsel}_{ss.ver}", hide_index=True, use_container_width=True,
+                              num_rows="fixed",
+                              column_config={"Presión recibo (psig)": st.column_config.NumberColumn(format="%.2f"),
+                                             "%DR": st.column_config.NumberColumn(format="%.4f"),
+                                             "FR": st.column_config.NumberColumn(format="%.4f"),
+                                             "Iny(+)/Entrega(−) bph": st.column_config.NumberColumn(format="%.2f"),
+                                             "Clientes (entregas)": st.column_config.TextColumn(
+                                                 help="Separados por coma; solo para el esquema.")})
+        cambio = False
+        for i, e in enumerate(ram.estaciones):
+            f_ = ed_e.iloc[i]
+            if i > 0 and str(f_["Estación"]).strip() and f_["Estación"] != e.nombre:
+                e.nombre, cambio = str(f_["Estación"]).strip(), True
+            bp = bool(f_["Bypass"]) and 0 < i < n_r
+            if bp != e.paso_directo:
+                e.paso_directo, cambio = bp, True
+            v = f_["Presión recibo (psig)"]
+            if i > 0 and not e.paso_directo and pd.notna(v) and float(v) != e.presion_recibo:
+                e.presion_recibo, cambio = float(v), True
+            for col, attr in (("%DR", "dr"), ("FR", "fr"), ("Iny(+)/Entrega(−) bph", "delta_bph")):
+                v = f_[col]
+                if pd.notna(v) and float(v) != getattr(e, attr):
+                    setattr(e, attr, float(v))
+                    cambio = True
+            cl = "" if pd.isna(f_["Clientes (entregas)"]) else str(f_["Clientes (entregas)"])
+            if cl != e.clientes:
+                e.clientes, cambio = cl, True
+        if cambio:
+            marcar()
+            ss.ver += 1
+            st.rerun()
+        if rs_r:
+            st.markdown("**Resultados del ramal**")
+            st.dataframe(tabla_estaciones_cadena(p, ram.nombre, ram, rs_r).style.format(precision=2, na_rep=""),
+                         use_container_width=True, hide_index=True)
+        if ram.tramos:
+            st.markdown("**Perfil de los tramos del ramal** (pegue desde Excel: punto, km, altura, espesor, "
+                        "diámetro, SMYS, rating)")
+            nt = [f"{t.nombre}: {ram.estaciones[i].nombre} → {ram.estaciones[i + 1].nombre}"
+                  f"{'' if t.puntos else '  (sin perfil)'}" for i, t in enumerate(ram.tramos)]
+            it_r = st.radio("Tramo del ramal", range(len(ram.tramos)), format_func=lambda k: nt[k], horizontal=True,
+                            key=f"ram_tr_{rsel}")
+            t_r = ram.tramos[it_r]
+            o1, o2, o3 = st.columns([1, 1, 3])
+            rug = o1.number_input("Rugosidad interna (in)", value=float(t_r.rugosidad_in), format="%.5f",
+                                  min_value=0.0, key=f"ram_rug_{rsel}_{it_r}_{ss.ver}")
+            eff = o2.number_input("Eficiencia (%)", value=min(max(float(t_r.eficiencia), 1.0), 200.0), min_value=1.0,
+                                  max_value=200.0, key=f"ram_eff_{rsel}_{it_r}_{ss.ver}")
+            if rug != t_r.rugosidad_in or eff != t_r.eficiencia:
+                t_r.rugosidad_in, t_r.eficiencia = rug, eff
+                marcar()
+                st.rerun()
+            if editor_perfil_tramo(t_r, rs_r[it_r] if it_r < len(rs_r) else None, f"ram_pts_{rsel}_{it_r}_{ss.ver}"):
+                marcar()
+                ss.ver += 1
+                st.rerun()
+
+        with st.expander("Clientes (entregas) de las estaciones de la línea principal"):
+            df_c = pd.DataFrame({"Estación": [e.nombre for e in p.estaciones],
+                                 "Clientes (entregas)": [e.clientes for e in p.estaciones]})
+            ed_c = st.data_editor(df_c, key=f"cli_main_{ss.ver}", hide_index=True, disabled=["Estación"],
+                                  use_container_width=True)
+            if any((("" if pd.isna(v) else str(v)) != e.clientes) for v, e in zip(ed_c["Clientes (entregas)"], p.estaciones)):
+                for v, e in zip(ed_c["Clientes (entregas)"], p.estaciones):
+                    e.clientes = "" if pd.isna(v) else str(v)
+                marcar()
+                ss.ver += 1
+                st.rerun()
+
+        # ---------------- perfil por ruta
+        st.markdown("##### 📈 Perfil hidráulico por ruta")
+        rutas = m.rutas_red(p)
+        k_ruta = st.selectbox("Ruta", range(len(rutas)), format_func=lambda k: rutas[k][0], key=f"ruta_{ss.sistema}",
+                              index=min(1, len(rutas) - 1))
+        pr_ruta, rs_ruta = m.proyecto_ruta(p, res, rutas[k_ruta][1])
+        if any(not t.puntos for t in pr_ruta.tramos):
+            st.info("Hay tramos sin perfil en esta ruta: péguelos en el editor de arriba.")
+        else:
+            curv_r = st.multiselect("Curvas", ["geod", "hid", "maop", "pint", "barlow", "minima"],
+                                    default=["geod", "hid", "maop"], format_func=lambda k: CURVAS[k],
+                                    key=f"curv_ruta_{ss.sistema}")
+            st.plotly_chart(figura_perfil(pr_ruta, rs_ruta, curv_r,
+                                          titulo=f"Perfil hidráulico – {rutas[k_ruta][0]} | {p.producto}"),
+                            use_container_width=True, config={"displaylogo": False})
+
+# ================================================================ FUGAS
+with tab_fuga:
+    st.markdown("Simula una **válvula ilícita** o un **derrame** en un km: el caudal que sale se calcula con la "
+                "ecuación de orificio **q = Cd·A·√(2·ΔP/ρ)** usando la presión interna en ese punto, y la línea se "
+                "recalcula con la fuga (aguas abajo pasa menos caudal, por lo que la presión en el punto también "
+                "baja; se resuelve por iteración).")
+    lineas = [""] + [r.nombre for r in p.ramales]
+    f1, f2, f3 = st.columns([1.3, 1.6, 1.6])
+    esc = f1.radio("Escenario", ["Válvula ilícita", "Derrame"], key=f"fg_esc_{ss.sistema}")
+    lin = f2.selectbox("Línea", lineas, format_func=lambda x: nombre_cadena(p, x), key=f"fg_lin_{ss.sistema}")
+    modo_f = f3.radio("Durante la fuga", m.MODOS_FUGA, key=f"fg_modo_{ss.sistema}",
+                      help="Caudal constante: entra al sistema el mismo caudal (la presión de descarga baja). "
+                           "Presión de descarga constante: la estación de aguas arriba mantiene su presión y entra "
+                           "más caudal (bombas de curva plana). La realidad suele estar entre las dos.")
+    cad_f = m.cadena_de(p, lin)
+    kms_f = [t.puntos[0].km for t in cad_f.tramos if t.puntos] + [t.puntos[-1].km for t in cad_f.tramos if t.puntos]
+    if not kms_f:
+        st.info("Esa línea no tiene perfiles cargados.")
+    else:
+        kmin, kmax = min(kms_f), max(kms_f)
+        g1, g2, g3, g4 = st.columns(4)
+        km_f = g1.number_input(f"km de la fuga ({kmin:,.3f} a {kmax:,.3f})", min_value=float(kmin),
+                               max_value=float(kmax), value=float(round((kmin + kmax) / 2, 3)), step=1.0,
+                               format="%.3f", key=f"fg_km_{ss.sistema}_{lin}")
+        d_int = m.diametro_interno_en_km(cad_f, km_f) or 0.0
+        if esc == "Válvula ilícita":
+            DIAM = {"1/4\"": 0.25, "1/2\"": 0.5, "3/4\"": 0.75, "1\"": 1.0, "1 1/2\"": 1.5, "2\"": 2.0, "3\"": 3.0,
+                    "4\"": 4.0}
+            dsel = g2.selectbox("Diámetro de la válvula", list(DIAM) + ["Otro"], index=1, key=f"fg_dsel_{ss.sistema}")
+            diam = DIAM.get(dsel) or g2.number_input("Diámetro (in)", 0.01, 48.0, 0.5, key=f"fg_dotro_{ss.sistema}")
+            contra = g3.number_input("Contrapresión a la salida (psig)", 0.0, 5000.0, 0.0, step=5.0,
+                                     key=f"fg_contra_{ss.sistema}",
+                                     help="0 = descarga a la atmósfera. Use una contrapresión si la válvula descarga "
+                                          "a una manguera o carrotanque (o para representar la pérdida de la manguera).")
+            tiempo = g4.number_input("Duración (horas)", 0.0, 10000.0, 24.0, step=1.0, key=f"fg_t_{ss.sistema}") * 60
+        else:
+            tam = g2.select_slider("Tamaño del orificio (% del diámetro interno)",
+                                   [5, 10, 20, 30, 50, 75, 100], value=10, key=f"fg_tam_{ss.sistema}",
+                                   help="100 % = rotura total (guillotina).")
+            diam = d_int * tam / 100
+            g2.caption(f"Diámetro interno en el km: {d_int:.3f} in → orificio de {diam:.3f} in")
+            contra = 0.0
+            tiempo = g3.number_input("Tiempo hasta detectar y parar el bombeo (min)", 0.0, 10000.0, 30.0, step=5.0,
+                                     key=f"fg_t_{ss.sistema}")
+        cd_f = g4.number_input("Coeficiente de descarga Cd", 0.1, 1.0, 0.61, step=0.01, key=f"fg_cd_{ss.sistema}",
+                               help="0,61 = orificio de borde vivo. Una válvula parcialmente abierta o una conexión "
+                                    "con manguera tiene un Cd efectivo menor.")
+        if st.button("▶ Simular fuga", type="primary", key=f"fg_btn_{ss.sistema}"):
+            try:
+                with st.spinner("Calculando la fuga…"):
+                    ss[f"fuga_{ss.sistema}"] = m.simular_fuga(p, km_f, diam, cd_f, contra, modo_f, lin, tiempo)
+            except Exception as ex:  # noqa: BLE001
+                st.error(f"No se pudo simular: {ex}")
+        f = ss.get(f"fuga_{ss.sistema}")
+        if f:
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Caudal de la fuga", f"{f['q_bph']:,.1f} bph",
+                      f"{f['q_bpd']:,.0f} bbl/día · {f['q_m3h']:,.2f} m³/h", delta_color="off")
+            h2.metric("% del caudal que llega al punto", f"{f['pct_fuga']:.2f} %",
+                      f"llegan {f['flujo_llega_kbd']:,.2f} KBDO", delta_color="off")
+            h3.metric("Presión interna en el punto", f"{f['px_fuga']:,.1f} psig",
+                      f"{f['px_fuga'] - f['px_base']:+,.1f} psi (sin fuga {f['px_base']:,.1f})", delta_color="off")
+            h4.metric("Volumen perdido", f"{f['volumen_bbl']:,.1f} bbl",
+                      f"en {f['tiempo_min'] / 60:,.1f} h" if f['tiempo_min'] >= 120 else f"en {f['tiempo_min']:,.0f} min",
+                      delta_color="off")
+            if f["modo"].startswith("Caudal"):
+                st.info(f"Con caudal constante, la presión de descarga de **{f['estacion_control']}** pasa de "
+                        f"{f['d_control_base']:,.1f} a **{f['d_control_fuga']:,.1f} psig** "
+                        f"({f['d_control_fuga'] - f['d_control_base']:+,.1f} psi): es la señal que vería la operación.")
+            else:
+                st.info(f"Para mantener la descarga de **{f['estacion_control']}** en {f['d_control_base']:,.1f} psig "
+                        f"el caudal de entrada pasa de {f['flujo_entrada_base']:,.2f} a "
+                        f"**{f['flujo_entrada_fuga']:,.2f} KBDO** ({(f['flujo_entrada_fuga'] - f['flujo_entrada_base']) * m.KBD_A_BPH:+,.0f} bph).")
+            if f["toda_la_corriente"]:
+                st.warning("El orificio es tan grande que **todo el caudal que llega sale por la fuga**: aguas abajo la "
+                           "línea queda sin flujo (posible columna separada / vaciado).")
+            if f.get("nota"):
+                st.warning(f["nota"])
+            st.dataframe(pd.DataFrame(f["comparacion"]).style.format(precision=2, na_rep=""), use_container_width=True,
+                         hide_index=True)
+            st.plotly_chart(figura_fuga(f), use_container_width=True, config={"displaylogo": False})
+            if esc == "Válvula ilícita" and st.toggle("Ver sensibilidad al diámetro de la válvula",
+                                                      key=f"fg_sens_{ss.sistema}"):
+                filas_s = []
+                barra = st.progress(0.0, text="Calculando sensibilidad…")
+                for kd, dd in enumerate((0.25, 0.5, 0.75, 1.0, 1.5, 2.0)):
+                    barra.progress((kd + 1) / 6, text=f"Calculando sensibilidad… válvula de {dd} in")
+                    try:
+                        x = m.simular_fuga(p, f["km"], dd, f["cd"], f["contrapresion_psi"], f["modo"], f["cadena"],
+                                           f["tiempo_min"])
+                        filas_s.append({"Diámetro (in)": dd, "Fuga (bph)": x["q_bph"], "Fuga (bbl/día)": x["q_bpd"],
+                                        "% del caudal": x["pct_fuga"], "P. en el punto (psig)": x["px_fuga"],
+                                        f"Descarga {x['estacion_control']} (psig)": x["d_control_fuga"],
+                                        "Entrada (KBDO)": x["flujo_entrada_fuga"]})
+                    except Exception:  # noqa: BLE001
+                        pass
+                barra.empty()
+                st.dataframe(pd.DataFrame(filas_s).style.format(precision=2), use_container_width=True,
+                             hide_index=True)
+            st.caption("Supuestos: estado estable (sin golpe de ariete), orificio con Cd constante, presión de recibo "
+                       "de las estaciones fija, válvulas de cheque que impiden el contraflujo desde aguas abajo. Es un "
+                       "estimado para priorizar; no reemplaza la simulación transitoria (SPS).")
 
 # ================================================================ PERFILES MOP / TRANSITORIOS
 with tabs[1]:
@@ -941,7 +1552,7 @@ with tabs[2]:
                   label_visibility="collapsed")
     t, r = p.tramos[it], res[it]
     e0 = p.estaciones[it]
-    q = m.flujos_por_tramo(p)[it]
+    q = r.flujo_kbd
     filas = [("Caudal (kBDO)", f"{q:,.2f}"), ("Caudal (m3/s)", f"{q * m.KBD_A_M3S:.4f}"),
              ("bph", f"{q * m.KBD_A_BPH:,.2f}"), ("Densidad (kg/m3)", f"{p.densidad:,.2f}"),
              ("Viscosidad (cSt)", f"{p.viscosidad:.3f}"), ("ºAPI", f"{141.5e3 / p.densidad - 131.5:.2f}"),
@@ -1159,6 +1770,13 @@ with tabs[8]:
 4b. **Presión mínima de recibo (descuelgue)**: en la hoja Resumen, columnas *P. mín. recibo sin descuelgue* y
    *Holgura*, y el panel 🔻 con el punto crítico (km, cota), el recibo mínimo en psig y en metros de columna, la descarga
    necesaria y un botón para aplicarla. La curva *Línea mínima sin descuelgue* la muestra en el gráfico.
+4c. **🔀 Red / ramales**: esquema del sistema. Haga clic en una estación para agregar un ramal (tramos nuevos que salen
+   de ahí): importe su plantilla Excel, cópielo de otro sistema o créelo vacío y pegue los perfiles. El flujo se reparte
+   con un **% fijo** (válvula de control) o por **hidráulica** (con las presiones de recibo de cada destino). Muestra
+   la presión en el nodo, cuánto estrangula la válvula y el perfil hidráulico de cada ruta.
+4d. **💧 Fugas / válvula ilícita**: caudal que sale por una válvula ilícita o un derrame en un km (ecuación de orificio
+   con la presión de la línea, recalculando la línea con la fuga), volumen perdido y cómo cambian las presiones y
+   caudales en las estaciones (con caudal constante o con presión de descarga constante).
 5. **Tramos**: perfil completo de cada tramo. Las columnas ✏️ se pueden editar o pegar desde Excel.
 6. **Actualizar espesores**: por rango de km o con un archivo de rangos de una inspección.
 7. **💾 Guardar**: guarda en la base de datos compartida y registra los cambios en el **Historial**. Si otro

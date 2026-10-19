@@ -98,6 +98,7 @@ class Estacion:
     fr: float = 1 / 1.1              # Factor de rotura (fila 11)
     inyeccion: str = "Sin inyección"  # Resumen col J
     delta_bph: float = 0.0           # inyección (+) / entrega al paso (−) en la estación, bph
+    clientes: str = ""               # entregas a clientes (solo para el esquema), p.ej. "BIOMAX, PUMA"
 
 
 @dataclass
@@ -117,6 +118,7 @@ class Proyecto:
     km_interpolar: list = field(default_factory=lambda: [5, 20, 90, 100])
     perfiles_externos: list = field(default_factory=list)   # perfiles MOP / transitorios cargados
     margen_descuelgue_psi: float = 0.0   # presión interna mínima exigida contra descuelgue (0 = cabeza = altura)
+    ramales: list = field(default_factory=list)   # list[Ramal]: derivaciones del flujo (red de tramos)
 
     # ---------------- serialización ----------------
     def to_dict(self):
@@ -125,20 +127,64 @@ class Proyecto:
     @staticmethod
     def from_dict(d):
         from dataclasses import fields as _campos
-        validos = {f.name for f in _campos(Proyecto)} - {"estaciones", "tramos"}
+        validos = {f.name for f in _campos(Proyecto)} - {"estaciones", "tramos", "ramales"}
         p = Proyecto(**{k: v for k, v in d.items() if k in validos})
-        campos_est = {f.name for f in _campos(Estacion)}
-        p.estaciones = [Estacion(**{k: v for k, v in e.items() if k in campos_est}) for e in d.get("estaciones", [])]
-        p.tramos = []
-        for t in d.get("tramos", []):
-            tr = Tramo(nombre=t["nombre"], rugosidad_in=t.get("rugosidad_in", 0.0018),
-                       eficiencia=t.get("eficiencia", 100.0),
-                       formato_antiguo=t.get("formato_antiguo", t.get("dra_en_laminar", False)),
-                       fila_inicio=t.get("fila_inicio", 3), dra_siempre=t.get("dra_siempre", False),
-                       factor_q=t.get("factor_q", KBD_A_M3S))
-            tr.puntos = [PuntoPerfil(**pp) for pp in t.get("puntos", [])]
-            p.tramos.append(tr)
+        p.estaciones = estaciones_desde(d.get("estaciones", []))
+        p.tramos = tramos_desde(d.get("tramos", []))
+        p.ramales = [Ramal.from_dict(r) for r in d.get("ramales", []) or []]
         return p
+
+
+def estaciones_desde(lista):
+    from dataclasses import fields as _campos
+    campos_est = {f.name for f in _campos(Estacion)}
+    return [e if isinstance(e, Estacion) else Estacion(**{k: v for k, v in e.items() if k in campos_est})
+            for e in lista]
+
+
+def tramos_desde(lista):
+    salida = []
+    for t in lista:
+        if isinstance(t, Tramo):
+            salida.append(t)
+            continue
+        tr = Tramo(nombre=t["nombre"], rugosidad_in=t.get("rugosidad_in", 0.0018),
+                   eficiencia=t.get("eficiencia", 100.0),
+                   formato_antiguo=t.get("formato_antiguo", t.get("dra_en_laminar", False)),
+                   fila_inicio=t.get("fila_inicio", 3), dra_siempre=t.get("dra_siempre", False),
+                   factor_q=t.get("factor_q", KBD_A_M3S))
+        tr.puntos = [p if isinstance(p, PuntoPerfil) else PuntoPerfil(**p) for p in t.get("puntos", [])]
+        salida.append(tr)
+    return salida
+
+
+MODOS_RAMAL = ("Porcentaje", "Hidráulico")
+
+
+@dataclass
+class Ramal:
+    """Derivación del flujo: cadena de tramos que sale de una estación (nodo) de la línea principal o de
+    otro ramal. estaciones[0] es el nodo (su %DR y FR aplican al primer tramo del ramal).
+
+    modo "Porcentaje": el ramal se lleva pct % del flujo que llega al nodo (válvula de control); la
+        presión en el nodo es la mayor que exijan los ramales y la otra rama estrangula la diferencia.
+    modo "Hidráulico": el reparto lo da la hidráulica (misma presión en el nodo para ambas ramas,
+        con las presiones de recibo de cada destino)."""
+    nombre: str
+    padre: str = ""                   # "" = línea principal; si no, nombre del ramal padre
+    nodo: int = 0                     # índice de la estación del padre donde se deriva
+    modo: str = "Porcentaje"
+    pct: float = 50.0
+    estaciones: list = field(default_factory=list)
+    tramos: list = field(default_factory=list)
+
+    @staticmethod
+    def from_dict(d):
+        r = Ramal(nombre=d.get("nombre", "Ramal"), padre=d.get("padre", "") or "", nodo=int(d.get("nodo", 0)),
+                  modo=d.get("modo", "Porcentaje"), pct=float(d.get("pct", 50.0)))
+        r.estaciones = estaciones_desde(d.get("estaciones", []))
+        r.tramos = tramos_desde(d.get("tramos", []))
+        return r
 
 
 # --------------------------------------------------------------------------
@@ -206,6 +252,8 @@ class ResultadoTramo:
 # --------------------------------------------------------------------------
 def factor_friccion_churchill(re, rug_mm, d_mm):
     """Ecuación de Churchill tal como está en la columna M."""
+    if re < 1.0:                     # caudal prácticamente nulo: flujo laminar (Darcy 64/Re = 8·(8/Re))
+        return 64 / re
     a = (2.457 * math.log(1 / ((7 / re) ** 0.9 + 0.27 * rug_mm / d_mm))) ** 16
     b = (37530 / re) ** 16
     return 8 * ((8 / re) ** 12 + 1 / (a + b) ** 1.5) ** (1 / 12)
@@ -281,7 +329,10 @@ def calcular_tramo(tramo: Tramo, flujo_kbd, densidad, visc_cst, dr, fr, presion_
 
 
 def flujos_por_tramo(proy: Proyecto):
-    """Resumen col E: flujo acumulado con inyecciones (bph*0.024 = kbd)."""
+    """Resumen col E: flujo acumulado con inyecciones (bph*0.024 = kbd).
+    Con ramales: el flujo que sigue por la línea principal después de cada derivación."""
+    if getattr(proy, "ramales", None):
+        return [r.flujo_kbd for r in calcular_red(proy)]
     flujos, prev = [], proy.flujo_kbd
     for est in proy.estaciones[:len(proy.tramos)]:
         f = prev
@@ -296,7 +347,10 @@ def flujos_por_tramo(proy: Proyecto):
 
 
 def calcular_proyecto(proy: Proyecto, flujo_kbd=None):
-    """Calcula todos los tramos. Devuelve lista de ResultadoTramo (mismo orden que tramos)."""
+    """Calcula todos los tramos. Devuelve lista de ResultadoTramo (mismo orden que tramos).
+    Si el sistema tiene ramales (derivaciones), devuelve una lista Resultados con el atributo .red."""
+    if getattr(proy, "ramales", None):
+        return calcular_red(proy, flujo_kbd)
     if flujo_kbd is not None:
         original = proy.flujo_kbd
         proy.flujo_kbd = flujo_kbd
@@ -407,10 +461,15 @@ def curva_sistema(proy: Proyecto, lim_inf, lim_sup, pasos=10, dr_forzado=None):
 # --------------------------------------------------------------------------
 #  Celda a definir (salida):  ("descarga", i) ("roturas", i|None) ("descuelgues", i) ("remanente", i)
 #  Celda a cambiar (entrada): ("flujo", None) ("dr", i) ("recibo", j) ("iny1", None) ("iny2", None)
-ES_CONTEO = ("roturas", "descuelgues")
+ES_CONTEO = ("roturas", "descuelgues", "roturas_r")
 LIMITES_VAR = {"flujo": (0.0, 1e5), "bph": (0.0, 1e5 * KBD_A_BPH), "dr": (-1000.0, 1000.0), "recibo": (0.0, 1e5),
-               "iny1": (-1e6, 1e6), "iny2": (-1e6, 1e6)}
-PASO_VAR = {"flujo": 1.0, "bph": 40.0, "dr": 2.0, "recibo": 5.0, "iny1": 50.0, "iny2": 50.0}
+               "iny1": (-1e6, 1e6), "iny2": (-1e6, 1e6), "pct_ramal": (0.0, 100.0), "recibo_r": (0.0, 1e5)}
+PASO_VAR = {"flujo": 1.0, "bph": 40.0, "dr": 2.0, "recibo": 5.0, "iny1": 50.0, "iny2": 50.0, "pct_ramal": 5.0,
+            "recibo_r": 5.0}
+
+
+def _ramal(proy, nombre):
+    return next(r for r in proy.ramales if r.nombre == nombre)
 
 
 def celdas_salida(proy: Proyecto):
@@ -420,6 +479,13 @@ def celdas_salida(proy: Proyecto):
     out.append(("Rotura de tubo – TOTAL DEL SISTEMA", ("roturas", None)))
     out += [(f"Descuelgue – {est[i].nombre}", ("descuelgues", i)) for i in range(n)]
     out += [(f"Presión int remanente – {est[i].nombre}", ("remanente", i)) for i in range(n)]
+    for r in getattr(proy, "ramales", []):
+        out.append((f"Ramal {r.nombre}: flujo (KBDO)", ("flujo_ramal", r.nombre)))
+        out.append((f"Ramal {r.nombre}: % del flujo que se deriva", ("pct_calc", r.nombre)))
+        out.append((f"Ramal {r.nombre}: presión en el nodo", ("p_nodo", r.nombre)))
+        out += [(f"Ramal {r.nombre}: presión descarga – {r.estaciones[i].nombre}", ("descarga_r", (r.nombre, i)))
+                for i in range(len(r.tramos))]
+        out.append((f"Ramal {r.nombre}: rotura de tubo (total)", ("roturas_r", r.nombre)))
     return out
 
 
@@ -430,6 +496,11 @@ def celdas_entrada(proy: Proyecto):
     out += [(f"Presión recibo – {est[j].nombre}", ("recibo", j)) for j in range(1, n + 1)
             if not est[j].paso_directo]
     out += [("INY 1 (bph)", ("iny1", None)), ("INY 2 (bph)", ("iny2", None))]
+    for r in getattr(proy, "ramales", []):
+        if r.modo != "Hidráulico":
+            out.append((f"Ramal {r.nombre}: % del flujo", ("pct_ramal", r.nombre)))
+        out += [(f"Ramal {r.nombre}: presión recibo – {r.estaciones[j].nombre}", ("recibo_r", (r.nombre, j)))
+                for j in range(1, len(r.tramos) + 1) if not r.estaciones[j].paso_directo]
     return out
 
 
@@ -438,7 +509,9 @@ def leer_variable(proy: Proyecto, var):
     return {"dr": lambda: proy.estaciones[i].dr, "flujo": lambda: proy.flujo_kbd,
             "bph": lambda: proy.flujo_kbd * KBD_A_BPH,
             "recibo": lambda: proy.estaciones[i].presion_recibo,
-            "iny1": lambda: proy.iny1_bph, "iny2": lambda: proy.iny2_bph}[t]()
+            "iny1": lambda: proy.iny1_bph, "iny2": lambda: proy.iny2_bph,
+            "pct_ramal": lambda: _ramal(proy, i).pct,
+            "recibo_r": lambda: _ramal(proy, i[0]).estaciones[i[1]].presion_recibo}[t]()
 
 
 def fijar_variable(proy: Proyecto, var, valor):
@@ -455,6 +528,10 @@ def fijar_variable(proy: Proyecto, var, valor):
         proy.iny1_bph = valor
     elif t == "iny2":
         proy.iny2_bph = valor
+    elif t == "pct_ramal":
+        _ramal(proy, i).pct = valor
+    elif t == "recibo_r":
+        _ramal(proy, i[0]).estaciones[i[1]].presion_recibo = valor
 
 
 def evaluar_celda(proy: Proyecto, celda, res=None):
@@ -464,6 +541,20 @@ def evaluar_celda(proy: Proyecto, celda, res=None):
         return res[i].presion_descarga
     if t == "remanente":
         return res[i].presion_remanente or 0.0
+    if t in ("flujo_ramal", "pct_calc", "p_nodo", "descarga_r", "roturas_r"):
+        red = getattr(res, "red", None) or {}
+        inf = red.get(i[0] if isinstance(i, tuple) else i)
+        if inf is None:
+            return 0.0
+        if t == "flujo_ramal":
+            return inf["flujo"]
+        if t == "pct_calc":
+            return inf["pct_calculado"]
+        if t == "p_nodo":
+            return inf["p_nodo"] or 0.0
+        if t == "descarga_r":
+            return inf["res"][i[1]].presion_descarga
+        return sum(x.roturas for x in inf["res"])
     sel = res if i is None else [res[i]]
     if t == "roturas":
         return sum(r.roturas for r in sel)
@@ -913,6 +1004,531 @@ def presion_minima_recibo(proy: Proyecto, res, margen_psi=None):
         })
         salida.append(d)
     return salida
+
+
+# --------------------------------------------------------------------------
+# ESCENARIOS: VÁLVULA ILÍCITA / DERRAME (fuga por un orificio en un km)
+# --------------------------------------------------------------------------
+PSI_A_PA = 6894.757
+BBL_A_M3 = 0.158987294928
+MODOS_FUGA = ("Caudal constante", "Presión de descarga constante")
+
+
+def caudal_orificio_bph(diametro_in, dp_psi, densidad, cd=0.61):
+    """Ecuación de orificio: q = Cd·A·√(2·ΔP/ρ). Devuelve bph."""
+    if dp_psi <= 0 or diametro_in <= 0 or densidad <= 0:
+        return 0.0
+    area = math.pi / 4 * (diametro_in * IN_A_M) ** 2
+    q_m3s = cd * area * math.sqrt(2 * dp_psi * PSI_A_PA / densidad)
+    return q_m3s * 3600 / BBL_A_M3
+
+
+def presion_orificio_psi(q_bph, diametro_in, densidad, cd=0.61):
+    """Inversa: ΔP (psi) necesaria para que por el orificio pasen q_bph."""
+    area = math.pi / 4 * (diametro_in * IN_A_M) ** 2
+    if area <= 0 or cd <= 0:
+        return 0.0
+    q_m3s = q_bph * BBL_A_M3 / 3600
+    return densidad / 2 * (q_m3s / (cd * area)) ** 2 / PSI_A_PA
+
+
+def _raiz(f, a, b, fa=None, fb=None, tol=1e-6, maxit=60):
+    """Regula falsi (Illinois) para f creciente o decreciente con cambio de signo en [a, b]."""
+    fa = f(a) if fa is None else fa
+    fb = f(b) if fb is None else fb
+    if fa == 0:
+        return a
+    if fb == 0:
+        return b
+    lado = 0
+    c = a
+    for _ in range(maxit):
+        c = (a * fb - b * fa) / (fb - fa) if fb != fa else (a + b) / 2
+        fc = f(c)
+        if abs(fc) < tol or abs(b - a) < tol * max(1.0, abs(c)):
+            return c
+        if (fc > 0) == (fb > 0):
+            b, fb = c, fc
+            if lado == -1:
+                fa /= 2
+            lado = -1
+        else:
+            a, fa = c, fc
+            if lado == 1:
+                fb /= 2
+            lado = 1
+    return c
+
+
+def ubicar_tramo(cadena, km):
+    """Índice del tramo de la cadena que contiene el km (None si está fuera)."""
+    for i, t in enumerate(cadena.tramos):
+        if t.puntos and t.puntos[0].km <= km <= t.puntos[-1].km:
+            return i
+    return None
+
+
+def diametro_interno_en_km(cadena, km):
+    i = ubicar_tramo(cadena, km)
+    if i is None:
+        return None
+    pts = cadena.tramos[i].puntos
+    j = max(k for k in range(len(pts)) if pts[k].km <= km)
+    return pts[j].diam_ext - 2 * pts[j].espesor
+
+
+def _partir_tramo(t, km):
+    """Divide un tramo en el km: (aguas arriba, aguas abajo), con un punto interpolado en el km."""
+    pts = t.puntos
+    j = max(k for k in range(len(pts)) if pts[k].km <= km)
+    a = pts[j]
+    if a.km == km:
+        nuevo = replace(a, punto="Fuga", rating=0.0)
+    else:
+        b = pts[min(j + 1, len(pts) - 1)]
+        f = (km - a.km) / (b.km - a.km) if b.km != a.km else 0.0
+        nuevo = replace(a, punto="Fuga", km=km, altura=a.altura + (b.altura - a.altura) * f, rating=0.0)
+    arriba = [p for p in pts if p.km < km] + [nuevo]
+    abajo = [nuevo] + [p for p in pts if p.km > km]
+    if len(arriba) < 2:
+        arriba = [pts[0], nuevo]
+    if len(abajo) < 2:
+        abajo = [nuevo, replace(nuevo, punto=pts[-1].punto)]
+    return (replace(t, nombre=f"{t.nombre}a", puntos=arriba), replace(t, nombre=f"{t.nombre}b", puntos=abajo))
+
+
+def simular_fuga(proy: Proyecto, km, diametro_in, cd=0.61, contrapresion_psi=0.0, modo="Caudal constante",
+                 cadena="", tiempo_min=0.0):
+    """Simula una fuga (válvula ilícita o derrame) por un orificio de 'diametro_in' en el km indicado.
+
+    La fuga se representa como una estación virtual en el km (el tramo se parte en dos): aguas arriba
+    pasa el caudal que llega y aguas abajo ese caudal menos la fuga. El caudal de fuga sale de la
+    ecuación de orificio con la presión interna calculada en el punto (que a su vez baja con la fuga):
+    se resuelve por iteración.
+    modo "Caudal constante": el caudal que entra al sistema no cambia.
+    modo "Presión de descarga constante": la estación de bombeo aguas arriba mantiene su presión de
+        descarga y el caudal que entra aumenta (bombas de curva plana)."""
+    import copy
+    base_res = calcular_proyecto(proy)
+    pc = copy.deepcopy(proy)
+    pc.perfiles_externos = []
+    cad = cadena_de(pc, cadena)
+    if cad is None:
+        raise ValueError("No se encontró la línea / ramal indicado.")
+    idx = ubicar_tramo(cad, km)
+    if idx is None:
+        raise ValueError(f"El km {km} no está dentro de los tramos de esa línea.")
+    t_arriba, t_abajo = _partir_tramo(cad.tramos[idx], km)
+    est_ini = cad.estaciones[idx]
+    virtual = Estacion(nombre=f"FUGA km {km:.3f}", paso_directo=True, dr=est_ini.dr, fr=est_ini.fr)
+    cad.tramos[idx:idx + 1] = [t_arriba, t_abajo]
+    cad.estaciones.insert(idx + 1, virtual)
+    for r in pc.ramales:
+        if (r.padre or "") == (cadena or "") and r.nodo > idx:
+            r.nodo += 1
+
+    def res_cadena(res):
+        if not cadena:
+            return res
+        inf = (getattr(res, "red", None) or {}).get(cadena)
+        return inf["res"] if inf else []
+
+    densidad = pc.densidad
+    estado = {"total": False}
+
+    def evaluar(q_bph):
+        virtual.delta_bph = -q_bph
+        virtual.paso_directo = True
+        res = calcular_proyecto(pc)
+        rc = res_cadena(res)
+        return res, rc
+
+    def resolver_fuga():
+        """Caudal de fuga con el flujo de entrada actual de pc."""
+        res, rc = evaluar(0.0)
+        q_llega = rc[idx].flujo_kbd / BPH_A_KBD
+        px0 = rc[idx + 1].presion_descarga
+
+        def f(q):
+            _, rcq = evaluar(q)
+            return q - caudal_orificio_bph(diametro_in, rcq[idx + 1].presion_descarga - contrapresion_psi, densidad, cd)
+        f0 = -caudal_orificio_bph(diametro_in, px0 - contrapresion_psi, densidad, cd)
+        if f0 >= 0:                                   # presión menor que la contrapresión: no sale nada
+            estado["total"] = False
+            return 0.0, q_llega
+        f1 = f(q_llega)
+        if f1 <= 0:
+            # el orificio podría sacar más de lo que llega: sale todo y aguas abajo queda sin flujo
+            estado["total"] = True
+            return q_llega, q_llega
+        estado["total"] = False
+        return _raiz(f, 0.0, q_llega, f0, f1, tol=1e-6 * max(1.0, q_llega)), q_llega
+
+    def aplicar(q, q_llega):
+        res, rc = evaluar(q)
+        if estado["total"]:
+            virtual.paso_directo = False
+            virtual.presion_recibo = contrapresion_psi + presion_orificio_psi(q_llega, diametro_in, densidad, cd)
+            res = calcular_proyecto(pc)
+            rc = res_cadena(res)
+        return res, rc
+
+    # estación de control (la que bombea aguas arriba de la fuga)
+    s = idx
+    while s > 0 and cad.estaciones[s].paso_directo:
+        s -= 1
+    rb = res_cadena(base_res)
+    d_control_base = rb[s].presion_descarga if s < len(rb) else None
+    flujo_base = proy.flujo_kbd
+    nota_modo = ""
+    if modo.startswith("Presión") and d_control_base is not None:
+        def h(F):
+            pc.flujo_kbd = F
+            q, ql = resolver_fuga()
+            _, rc = aplicar(q, ql)
+            return rc[s].presion_descarga - d_control_base
+        h0 = h(flujo_base)
+        encontrado = abs(h0) < 1e-6
+        if not encontrado:
+            ant_F, ant_h = flujo_base, h0
+            for mult in (1.05, 1.15, 1.3, 1.5, 2.0, 3.0):          # primero buscar hacia más caudal
+                F = flujo_base * mult
+                hF = h(F)
+                if (hF > 0) != (ant_h > 0):
+                    pc.flujo_kbd = _raiz(h, ant_F, F, ant_h, hF, tol=1e-4)
+                    encontrado = True
+                    break
+                ant_F, ant_h = F, hF
+        if not encontrado:
+            ant_F, ant_h = flujo_base, h0
+            for mult in (0.95, 0.85, 0.7, 0.5, 0.3):                # y si no, hacia menos caudal
+                F = flujo_base * mult
+                hF = h(F)
+                if (hF > 0) != (ant_h > 0):
+                    pc.flujo_kbd = _raiz(h, ant_F, F, ant_h, hF, tol=1e-4)
+                    encontrado = True
+                    break
+                ant_F, ant_h = F, hF
+        if not encontrado:
+            pc.flujo_kbd = flujo_base
+            nota_modo = ("No se encontró un caudal de entrada que mantenga la presión de descarga; "
+                         "se usó caudal constante.")
+    q, q_llega = resolver_fuga()
+    res, rc = aplicar(q, q_llega)
+    px = rc[idx + 1].presion_descarga if not estado["total"] else virtual.presion_recibo
+
+    # presión interna en el km sin fuga (con la misma partición y fuga 0)
+    pb = copy.deepcopy(pc)
+    pb.flujo_kbd = flujo_base
+    cb = cadena_de(pb, cadena)
+    cb.estaciones[idx + 1].delta_bph = 0.0
+    cb.estaciones[idx + 1].paso_directo = True
+    res_b2 = calcular_proyecto(pb)
+    rcb = res_cadena(res_b2)
+    px_base = rcb[idx + 1].presion_descarga
+
+    # comparación por estación de la cadena (sin la estación virtual)
+    filas = []
+    est_orig = cadena_de(proy, cadena).estaciones
+    for i, e in enumerate(est_orig):
+        j = i if i <= idx else i + 1                  # índice en la cadena con la fuga
+        fila = {"Estación": e.nombre}
+        if i < len(rb):
+            fila["Descarga sin fuga (psig)"] = rb[i].presion_descarga
+            fila["Flujo sin fuga (KBDO)"] = rb[i].flujo_kbd
+        if j < len(rc):
+            fila["Descarga con fuga (psig)"] = rc[j].presion_descarga
+            fila["Flujo con fuga (KBDO)"] = rc[j].flujo_kbd
+        if i > 0:
+            fila["Recibo sin fuga (psig)"] = rb[i - 1].presion_recibo if i - 1 < len(rb) else None
+            jr = (i - 1) if (i - 1) < idx else i
+            if i - 1 == idx:
+                jr = idx + 1
+            fila["Recibo con fuga (psig)"] = rc[jr].presion_recibo if jr < len(rc) else None
+            fila["Flujo que llega sin fuga (KBDO)"] = rb[i - 1].flujo_kbd if i - 1 < len(rb) else None
+            fila["Flujo que llega con fuga (KBDO)"] = rc[jr].flujo_kbd if jr < len(rc) else None
+        filas.append(fila)
+    return {
+        "km": km, "cadena": cadena, "tramo": cadena_de(proy, cadena).tramos[idx].nombre, "diametro_in": diametro_in,
+        "cd": cd, "contrapresion_psi": contrapresion_psi, "modo": modo,
+        "q_bph": q, "q_bpd": q * 24, "q_m3h": q * BBL_A_M3, "q_kbd": q * BPH_A_KBD,
+        "volumen_bbl": q * tiempo_min / 60.0, "tiempo_min": tiempo_min,
+        "px_base": px_base, "px_fuga": px, "flujo_llega_kbd": q_llega * BPH_A_KBD,
+        "flujo_entrada_base": flujo_base, "flujo_entrada_fuga": pc.flujo_kbd,
+        "estacion_control": est_orig[s].nombre, "d_control_base": d_control_base,
+        "d_control_fuga": rc[s].presion_descarga if s < len(rc) else None,
+        "toda_la_corriente": estado["total"], "pct_fuga": 100.0 * q / q_llega if q_llega else 0.0,
+        "comparacion": filas, "proy_fuga": pc, "res_fuga": res, "res_base": base_res,
+        "idx_tramo": idx, "nota": nota_modo,
+    }
+
+
+# --------------------------------------------------------------------------
+# RED DE TRAMOS: ramales / derivaciones del flujo
+# --------------------------------------------------------------------------
+class Resultados(list):
+    """Lista de ResultadoTramo de la línea principal + .red (resultados de los ramales y nodos)."""
+    red = None
+
+
+def _flujos_cadena(estaciones, n, q0, iny1, iny2, extraccion, ignorar_inicio=False):
+    """Flujo de cada tramo de una cadena. extraccion[k] = fracción del flujo disponible en la estación k
+    que se va por ramales. Devuelve (flujos por tramo, flujo disponible en cada estación 0..n)."""
+    flujos, disp, prev = [], [], q0
+    for k in range(n + 1):
+        est = estaciones[k] if k < len(estaciones) else None
+        f = prev
+        if est is not None and k < n and not (ignorar_inicio and k == 0):
+            if est.inyeccion == "INY 2":
+                f += iny2 * BPH_A_KBD
+            elif est.inyeccion == "INY 1":
+                f += iny1 * BPH_A_KBD
+            f += (getattr(est, "delta_bph", 0.0) or 0.0) * BPH_A_KBD
+        disp.append(f)
+        if k < n:
+            f = f * (1 - extraccion.get(k, 0.0))
+            flujos.append(f)
+            prev = f
+    return flujos, disp
+
+
+def _presiones_cadena(estaciones, tramos, flujos, dens, visc, req):
+    """Igual que calcular_proyecto (de aguas abajo hacia aguas arriba) pero en una estación en bypass con
+    ramales, la presión del nodo es la mayor entre la que pide la línea y la que piden los ramales (req)."""
+    n = len(tramos)
+    res = [None] * n
+    for i in range(n - 1, -1, -1):
+        est_ini, est_fin = estaciones[i], estaciones[i + 1]
+        if est_fin.paso_directo and i + 1 < n and res[i + 1] is not None:
+            p_rec = res[i + 1].presion_descarga
+            if i + 1 in req:
+                p_rec = max(p_rec, req[i + 1])
+        else:
+            p_rec = est_fin.presion_recibo
+        res[i] = calcular_tramo(tramos[i], flujos[i], dens, visc, est_ini.dr, est_ini.fr, p_rec)
+    return res
+
+
+def _hijos(proy, nombre_padre):
+    return [r for r in proy.ramales if (r.padre or "") == nombre_padre]
+
+
+def _evaluar(proy, cadena, nombre, q0, fracs, salida, es_ramal):
+    """Calcula una cadena (línea principal o ramal) y, recursivamente, sus ramales."""
+    n = len(cadena.tramos)
+    hijos = [h for h in _hijos(proy, nombre) if 0 <= h.nodo <= n]
+    ext = {}
+    for h in hijos:
+        ext[h.nodo] = ext.get(h.nodo, 0.0) + fracs[h.nombre]
+    ext = {k: min(v, 1.0) for k, v in ext.items()}
+    flujos, disp = _flujos_cadena(cadena.estaciones, n, q0, proy.iny1_bph, proy.iny2_bph, ext,
+                                  ignorar_inicio=es_ramal)
+    req = {}
+    for h in hijos:
+        qh = fracs[h.nombre] * disp[h.nodo]
+        res_h = _evaluar(proy, h, h.nombre, qh, fracs, salida, True)
+        d_h = res_h[0].presion_descarga if res_h else None
+        salida[h.nombre] = {"ramal": h, "res": res_h, "flujo": qh, "fraccion": fracs[h.nombre],
+                            "disponible_nodo": disp[h.nodo], "d_ramal": d_h, "padre": nombre, "nodo": h.nodo}
+        if d_h is not None:
+            req[h.nodo] = max(req.get(h.nodo, -1e99), d_h)
+    res = _presiones_cadena(cadena.estaciones, cadena.tramos, flujos, proy.densidad, proy.viscosidad, req)
+    for h in hijos:                                   # presión en el nodo y estrangulamiento
+        info = salida[h.nombre]
+        k = h.nodo
+        d_padre = res[k].presion_descarga if k < n else None
+        info["d_padre"] = d_padre
+        candidatos = [x for x in (d_padre, req.get(k)) if x is not None]
+        # presión en el nodo (cabezal común): la mayor que piden las ramas; si la estación está en bypass
+        # esa presión se transmite aguas arriba, si bombea es la descarga que deben dar sus bombas
+        p_nodo = max(candidatos) if candidatos else None
+        info["p_nodo"] = p_nodo
+        info["nodo_bombea"] = not (0 < k < n and cadena.estaciones[k].paso_directo)
+        info["estrangula_ramal"] = (p_nodo - info["d_ramal"]) if (p_nodo is not None and info["d_ramal"] is not None) else None
+        info["estrangula_padre"] = (p_nodo - d_padre) if (p_nodo is not None and d_padre is not None) else None
+        info["flujo_padre_despues"] = (res[k].flujo_kbd if k < n else None)
+    return res
+
+
+def calcular_red(proy: Proyecto, flujo_kbd=None, iteraciones=40):
+    """Calcula la línea principal y todos sus ramales.
+
+    Ramales en modo Porcentaje: fracción fija. Ramales en modo Hidráulico: se busca la fracción con la
+    que la presión que pide el ramal en el nodo es igual a la que pide la línea que continúa
+    (mismo nodo, sin válvula de control); se resuelve por bisección (barridos sucesivos si hay varios)."""
+    q0 = proy.flujo_kbd if flujo_kbd is None else flujo_kbd
+    nombres = {r.nombre for r in proy.ramales}
+    fracs = {r.nombre: min(max(r.pct / 100.0, 0.0), 1.0) for r in proy.ramales}
+    hidraulicos = [r for r in proy.ramales if r.modo == "Hidráulico"]
+    notas = {}
+
+    def evaluar_todo():
+        salida = {}
+        res = _evaluar(proy, proy, "", q0, fracs, salida, False)
+        return res, salida
+
+    for _ in range(4 if len(hidraulicos) > 1 else 1):
+        for h in hidraulicos:
+            if h.padre and h.padre not in nombres:
+                continue
+
+            def g(fr):
+                fracs[h.nombre] = fr
+                res, sal = evaluar_todo()
+                inf = sal.get(h.nombre)
+                if not inf or inf["d_padre"] is None or inf["d_ramal"] is None:
+                    return None
+                return inf["d_padre"] - inf["d_ramal"]
+            g0, g1 = g(0.0), g(1.0)
+            if g0 is None:
+                fracs[h.nombre] = min(max(h.pct / 100.0, 0.0), 1.0)
+                notas[h.nombre] = ("El reparto hidráulico necesita que la línea continúe después del nodo; "
+                                   "se usó el porcentaje.")
+                continue
+            if g0 <= 0:
+                fracs[h.nombre] = 0.0
+                notas[h.nombre] = "Con estas presiones de recibo el ramal no recibe flujo (la línea pide más presión)."
+                continue
+            if g1 >= 0:
+                fracs[h.nombre] = 1.0
+                notas[h.nombre] = "Con estas presiones de recibo todo el flujo se va por el ramal."
+                continue
+            fracs[h.nombre] = _raiz(g, 0.0, 1.0, g0, g1, tol=1e-9, maxit=iteraciones)
+            notas.pop(h.nombre, None)
+    res, salida = evaluar_todo()
+    for nom, inf in salida.items():
+        inf["nota"] = notas.get(nom, "")
+        inf["pct_calculado"] = 100.0 * inf["fraccion"]
+    out = Resultados(res)
+    out.red = salida
+    return out
+
+
+def proyecto_ramal(proy: Proyecto, ramal, flujo=None):
+    """Vista de un ramal como Proyecto (comparte estaciones y tramos) para graficar o exportar."""
+    return Proyecto(sistema=f"{proy.sistema} – {ramal.nombre}", fecha=proy.fecha, responsable=proy.responsable,
+                    flujo_kbd=flujo if flujo is not None else proy.flujo_kbd, producto=proy.producto,
+                    densidad=proy.densidad, viscosidad=proy.viscosidad, iny1_bph=proy.iny1_bph,
+                    iny2_bph=proy.iny2_bph, estaciones=ramal.estaciones, tramos=ramal.tramos,
+                    productos=proy.productos, margen_descuelgue_psi=proy.margen_descuelgue_psi)
+
+
+def cadena_de(proy, nombre):
+    """Devuelve la cadena (Proyecto o Ramal) por nombre ('' = línea principal)."""
+    if not nombre:
+        return proy
+    return next((r for r in proy.ramales if r.nombre == nombre), None)
+
+
+def rutas_red(proy):
+    """Rutas desde el origen hasta cada destino final: lista de (nombre, [ramales en orden])."""
+    rutas = [("Línea principal: " + (proy.estaciones[0].nombre if proy.estaciones else "") + " → "
+              + (proy.estaciones[-1].nombre if proy.estaciones else ""), [])]
+
+    def camino(r):
+        cad = [r]
+        while cad[0].padre:
+            p = cadena_de(proy, cad[0].padre)
+            if p is None:
+                break
+            cad.insert(0, p)
+        return cad
+    for r in proy.ramales:
+        cad = camino(r)
+        ini = proy.estaciones[0].nombre if proy.estaciones else ""
+        fin = r.estaciones[-1].nombre if r.estaciones else r.nombre
+        rutas.append((f"{ini} → {fin} (por {' / '.join(x.nombre for x in cad)})", cad))
+    return rutas
+
+
+def proyecto_ruta(proy, res, cadena_ramales):
+    """Une la línea principal hasta el nodo con los ramales del camino: (Proyecto, resultados) lineales
+    para graficar el perfil hidráulico de la ruta. El km de los ramales se desplaza si no continúa el del
+    nodo (p.ej. un ramal con km desde 0)."""
+    if not cadena_ramales:
+        return proy, list(res)
+    red = getattr(res, "red", None) or {}
+    est, tr, rs = [], [], []
+    cad_actual, res_actual = proy, list(res)
+    for r in cadena_ramales:
+        k = r.nodo
+        est += cad_actual.estaciones[:k]
+        tr += cad_actual.tramos[:k]
+        rs += res_actual[:k]
+        inf = red.get(r.nombre)
+        km_nodo = (max((p.km for p in cad_actual.tramos[k - 1].puntos), default=0.0) if k > 0
+                   else (cad_actual.tramos[0].puntos[0].km if cad_actual.tramos and cad_actual.tramos[0].puntos else 0.0))
+        if tr and k == 0:
+            km_nodo = max(p.km for p in tr[-1].puntos)
+        desplaz = 0.0
+        if r.tramos and r.tramos[0].puntos:
+            ini = r.tramos[0].puntos[0].km
+            if abs(ini - km_nodo) > 0.5:
+                desplaz = km_nodo - ini
+        tramos_r = r.tramos
+        if desplaz:
+            tramos_r = [replace(t, puntos=[replace(p, km=p.km + desplaz) for p in t.puntos]) for t in r.tramos]
+        est_r = list(r.estaciones)
+        if est_r:
+            est_r[0] = replace(est_r[0], nombre=cad_actual.estaciones[k].nombre if k < len(cad_actual.estaciones)
+                               else est_r[0].nombre)
+        cad_actual = Ramal(nombre=r.nombre, estaciones=est_r, tramos=tramos_r)
+        res_actual = list(inf["res"]) if inf else []
+    est += cad_actual.estaciones
+    tr += cad_actual.tramos
+    rs += res_actual
+    ult = cadena_ramales[-1]
+    p = Proyecto(sistema=f"{proy.sistema} – ruta {ult.nombre}", flujo_kbd=proy.flujo_kbd, producto=proy.producto,
+                 densidad=proy.densidad, viscosidad=proy.viscosidad, estaciones=est, tramos=tr,
+                 productos=proy.productos, margen_descuelgue_psi=proy.margen_descuelgue_psi,
+                 perfiles_externos=[])
+    return p, rs
+
+
+def nuevo_ramal_desde_proyecto(proy: Proyecto, otro: Proyecto, nombre, padre="", nodo=0, modo="Porcentaje",
+                               pct=50.0):
+    """Crea un ramal con las estaciones y tramos de otro sistema (p.ej. importado de su plantilla Excel).
+    La primera estación del otro sistema se toma como el nodo de derivación."""
+    import copy
+    est = copy.deepcopy(otro.estaciones)
+    trs = copy.deepcopy(otro.tramos)
+    cad = cadena_de(proy, padre)
+    if cad is not None and est and nodo < len(cad.estaciones):
+        est[0].nombre = cad.estaciones[nodo].nombre
+    est[0].paso_directo = False
+    return Ramal(nombre=nombre, padre=padre, nodo=nodo, modo=modo, pct=pct, estaciones=est, tramos=trs)
+
+
+def nuevo_ramal_vacio(proy, nombre, padre, nodo, nombres_estaciones, modo="Porcentaje", pct=50.0):
+    """Ramal con estaciones nuevas y tramos sin perfil (el perfil se pega o importa después)."""
+    cad = cadena_de(proy, padre)
+    nodo_nombre = cad.estaciones[nodo].nombre if cad is not None and nodo < len(cad.estaciones) else "Nodo"
+    est = [Estacion(nombre=nodo_nombre)] + [Estacion(nombre=x) for x in nombres_estaciones]
+    trs = [Tramo(nombre=f"{nombre}-{i + 1}") for i in range(len(nombres_estaciones))]
+    return Ramal(nombre=nombre, padre=padre, nodo=nodo, modo=modo, pct=pct, estaciones=est, tramos=trs)
+
+
+def posiciones_esquema(p):
+    """Coordenadas del esquema de la red: línea principal en horizontal (y = 0); cada ramal en una fila
+    nueva debajo, saliendo de su nodo. Devuelve {(cadena, índice estación): (x, y)}."""
+    pos = {("", i): (float(i), 0.0) for i in range(len(p.estaciones))}
+    fila = 0
+    pendientes = list(p.ramales)
+    while pendientes:
+        # se ubica primero el ramal que sale más a la derecha: así cada fila nueva (más abajo) empieza a la
+        # izquierda de las anteriores y su conector vertical no cruza estaciones de otros ramales
+        listos = [r for r in pendientes if (r.padre or "", r.nodo) in pos]
+        if not listos:
+            break
+        r = max(listos, key=lambda x: pos[(x.padre or "", x.nodo)][0])
+        base = pos[(r.padre or "", r.nodo)]
+        fila += 1
+        y = -1.25 * fila
+        for j in range(1, len(r.estaciones)):
+            pos[(r.nombre, j)] = (base[0] + j, y)
+        pos[(r.nombre, 0)] = base
+        pendientes.remove(r)
+    return pos
 
 # --------------------------------------------------------------------------
 # Importación desde la plantilla Excel
@@ -1620,6 +2236,32 @@ def diferencias(viejo: Proyecto, nuevo: Proyecto):
                 continue
             if a != b:
                 cambios.append((f"Estación {en.nombre}", None, et, _fmt_hist(a), _fmt_hist(b)))
+    rv = {r.nombre: r for r in getattr(viejo, "ramales", [])}
+    rn = {r.nombre: r for r in getattr(nuevo, "ramales", [])}
+    for nom in rn.keys() - rv.keys():
+        cambios.append((f"Ramal {nom}", None, "Ramal agregado", "", f"{len(rn[nom].tramos)} tramos"))
+    for nom in rv.keys() - rn.keys():
+        cambios.append((f"Ramal {nom}", None, "Ramal quitado", f"{len(rv[nom].tramos)} tramos", ""))
+    for nom in rn.keys() & rv.keys():
+        a_, b_ = rv[nom], rn[nom]
+        for campo, et in (("modo", "Modo de reparto"), ("pct", "% del flujo"), ("nodo", "Nodo"), ("padre", "Padre")):
+            if getattr(a_, campo) != getattr(b_, campo):
+                cambios.append((f"Ramal {nom}", None, et, _fmt_hist(getattr(a_, campo)), _fmt_hist(getattr(b_, campo))))
+        for eo, en in zip(a_.estaciones, b_.estaciones):
+            for campo, et in [("presion_recibo", "Presión recibo"), ("paso_directo", "Bypass"), ("dr", "%DR"),
+                              ("fr", "FR"), ("delta_bph", "Iny(+)/Entrega(−) bph")]:
+                x, y = getattr(eo, campo, 0.0), getattr(en, campo, 0.0)
+                if x != y:
+                    cambios.append((f"Ramal {nom} – {en.nombre}", None, et, _fmt_hist(x), _fmt_hist(y)))
+        for to, tn in zip(a_.tramos, b_.tramos):
+            if len(to.puntos) != len(tn.puntos):
+                cambios.append((f"Ramal {nom} – {tn.nombre}", None, "Puntos del perfil", len(to.puntos), len(tn.puntos)))
+                continue
+            for po, pn in zip(to.puntos, tn.puntos):
+                for campo, et in CAMPOS_PUNTO:
+                    x, y = getattr(po, campo), getattr(pn, campo)
+                    if x != y:
+                        cambios.append((f"Ramal {nom} – {tn.nombre}", pn.km, et, _fmt_hist(x), _fmt_hist(y)))
     if len(viejo.tramos) != len(nuevo.tramos):
         cambios.append(("", None, "Número de tramos", len(viejo.tramos), len(nuevo.tramos)))
     for to, tn in zip(viejo.tramos, nuevo.tramos):
@@ -1726,6 +2368,55 @@ def exportar_resultados_excel(proy, res, ruta, curva=None):
                 elif r.R[k]:
                     c.fill = amar
         wt.freeze_panes = "B3"
+
+    # Red: nodos de derivación y tramos de cada ramal
+    red = getattr(res, "red", None) or {}
+    if red:
+        wr = wb.create_sheet("Red - ramales")
+        encabezado(wr, 1, ["Ramal", "Sale de", "Nodo", "Modo", "% del flujo", "Flujo ramal (KBDO)",
+                           "Flujo disponible en el nodo (KBDO)", "Presión en el nodo (psig)",
+                           "P. que pide la línea (psig)", "P. que pide el ramal (psig)",
+                           "Estrangula línea (psi)", "Estrangula ramal (psi)", "Nota"])
+        for i, (nom, inf) in enumerate(red.items(), 2):
+            ram = inf["ramal"]
+            padre = cadena_de(proy, ram.padre)
+            nodo = padre.estaciones[ram.nodo].nombre if padre is not None and ram.nodo < len(padre.estaciones) else ""
+            vals = [nom, ram.padre or "Línea principal", nodo, ram.modo, inf["pct_calculado"], inf["flujo"],
+                    inf["disponible_nodo"], inf["p_nodo"], inf["d_padre"], inf["d_ramal"], inf["estrangula_padre"],
+                    inf["estrangula_ramal"], inf.get("nota", "")]
+            for j, v in enumerate(vals, 1):
+                wr.cell(i, j, v)
+            f = len(red) + 4 + (i - 2) * (len(ram.estaciones) + 3)
+            wr.cell(f, 1, f"Ramal {nom}").font = Font(bold=True)
+            encabezado(wr, f + 1, ["Estación", "Ubicación (km)", "Presión recibo (psig)", "Presión descarga (psig)",
+                                   "Flujo (Kbdo)", "Rotura de tubo", "Lleno de línea (kbls)", "Tramo"])
+            pr = proyecto_ramal(proy, ram, inf["flujo"])
+            kr = km_estaciones(pr)
+            rr = inf["res"]
+            for k, e in enumerate(ram.estaciones):
+                r = rr[k] if k < len(rr) else None
+                fila = [e.nombre, kr[k] if k < len(kr) else None, rr[k - 1].presion_recibo if 0 < k <= len(rr) else None]
+                if r:
+                    fila += [r.presion_descarga, r.flujo_kbd, r.roturas, r.lleno_kbls, r.nombre]
+                for j, v in enumerate(fila, 1):
+                    wr.cell(f + 2 + k, j, v)
+            for tr, r in zip(ram.tramos, rr):
+                if not tr.puntos:
+                    continue
+                wt = wb.create_sheet(f"{nom[:18]} {tr.nombre}"[:31])
+                wt["A1"] = (f"Ramal {nom} | Caudal {r.flujo_kbd:.4f} KBDO | %DR {r.dr:.4f} | "
+                            f"P.descarga {r.presion_descarga:.2f} | P.recibo {r.presion_recibo:.2f}")
+                encabezado(wt, 2, cab)
+                for k, pt in enumerate(tr.puntos):
+                    vals = [pt.punto, pt.km, pt.altura, pt.espesor, pt.diam_ext, pt.smys, r.J[k], r.K[k], r.L[k],
+                            r.M[k], r.N[k], r.O[k], r.P[k], r.Q[k], r.R[k], r.S[k], r.T[k], pt.rating or None]
+                    for j, v in enumerate(vals, 1):
+                        c = wt.cell(k + 3, j, v)
+                        if r.S[k]:
+                            c.fill = rojo
+                        elif r.R[k]:
+                            c.fill = amar
+                wt.freeze_panes = "B3"
 
     if curva:
         wc = wb.create_sheet("Curva del sistema")
