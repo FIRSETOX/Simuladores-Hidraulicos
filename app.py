@@ -13,7 +13,27 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import importlib
+
 import motor as m
+
+# Funciones del motor que necesita esta versión de app.py. Si el servidor tiene cargado un motor.py viejo
+# (Streamlit no siempre recarga los módulos importados al actualizar el repositorio), se recarga aquí.
+REQUERIDOS_MOTOR = ("presion_minima_recibo", "tolerancia_perfil", "verificar_perfil", "leer_perfil_presion",
+                    "buscar_objetivo", "importar_plantilla_excel")
+
+
+def _motor_incompleto():
+    faltan = [f for f in REQUERIDOS_MOTOR if not hasattr(m, f)]
+    campos_est = {f.name for f in dataclasses.fields(m.Estacion)}
+    campos_proy = {f.name for f in dataclasses.fields(m.Proyecto)}
+    faltan += [c for c in ("delta_bph",) if c not in campos_est]
+    faltan += [c for c in ("perfiles_externos", "margen_descuelgue_psi") if c not in campos_proy]
+    return faltan
+
+
+if _motor_incompleto():
+    m = importlib.reload(m)
 
 st.set_page_config(page_title="Simulador Hidráulico", page_icon="🛢️", layout="wide")
 
@@ -104,21 +124,19 @@ def marcar():
     ss.modificado = True
 
 
-VERSION_CODIGO = "2026-10-19c"
+VERSION_CODIGO = "2026-10-19d"
 
 
 def motor_desactualizado():
     """True si motor.py en el servidor es más viejo que app.py (no se subió el motor.py nuevo)."""
-    campos_est = {f.name for f in dataclasses.fields(m.Estacion)}
-    campos_proy = {f.name for f in dataclasses.fields(m.Proyecto)}
-    return ("delta_bph" not in campos_est or "perfiles_externos" not in campos_proy
-            or not hasattr(m, "tolerancia_perfil"))
+    return bool(_motor_incompleto())
 
 
 def inicializar():
     if motor_desactualizado():
-        st.error("⚠️ El archivo **motor.py** del servidor está desactualizado respecto a **app.py**. Suba a GitHub "
-                 "el motor.py nuevo (junto con app.py) y recargue la página.")
+        st.error("⚠️ El archivo **motor.py** del servidor está desactualizado respecto a **app.py** (le falta: "
+                 + ", ".join(_motor_incompleto()) + "). Suba a GitHub el **motor.py** nuevo junto con app.py, "
+                 "espere 1-2 minutos y recargue la página. Si sigue igual: *Manage app → Reboot app*.")
         st.stop()
     # objetos creados con una versión anterior del código (sesión abierta durante una actualización):
     # se vuelve a cargar el sistema desde la base de datos para que tengan todos los campos nuevos.
