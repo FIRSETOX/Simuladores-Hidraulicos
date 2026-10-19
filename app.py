@@ -7,6 +7,7 @@ Ejecutar en el computador:   streamlit run app.py
 import dataclasses
 import html
 import io
+import math
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -51,6 +52,13 @@ AYUDA = {
     "descarga": "Presión requerida al inicio del tramo para llegar con la presión de recibo de la siguiente.",
     "roturas": "Número de puntos del tramo donde MAOP < Presión int × FR.",
     "remanente": "Mínima presión interna positiva del tramo (punto más crítico para descuelgue).",
+    "p_min_recibo": "Presión de recibo MÍNIMA para que el tramo que llega a esta estación no se descuelgue: la "
+                    "presión convertida a cabeza (m) alcanza justo para pasar el punto más alto (presión interna = "
+                    "margen en el punto crítico). Depende del caudal, %DR, producto y perfil del tramo.",
+    "holgura": "Presión de recibo actual − presión mínima sin descuelgue. Negativa (naranja) = el tramo se "
+               "descuelga (columna separada) con la presión actual.",
+    "margen_desc": "Presión interna mínima que se exige en el punto crítico. 0 = la cabeza de presión es igual a la "
+                   "altura del punto (límite teórico). Puede usar, p.ej., la presión de vapor del producto + un margen.",
     "lleno": "Lleno de línea del tramo en miles de barriles.",
 }
 
@@ -96,7 +104,7 @@ def marcar():
     ss.modificado = True
 
 
-VERSION_CODIGO = "2026-10-19b"
+VERSION_CODIGO = "2026-10-19c"
 
 
 def motor_desactualizado():
@@ -266,7 +274,7 @@ def dialogo_estado():
 COLORES_PERFILES = ["#2CA02C", "#FF7F0E", "#9467BD", "#8C564B", "#E377C2", "#17BECF", "#BCBD22"]
 CURVAS = {"geod": "Presión geodésica", "hid": "Presión int+geod", "maop": "MAOP+geod",
           "pint": "Presión interna (perfil MOP del simulador)", "barlow": "Presión de diseño Barlow / MAOP",
-          "perfiles": "Perfiles cargados (MOP / transitorios)"}
+          "perfiles": "Perfiles cargados (MOP / transitorios)", "minima": "Línea mínima sin descuelgue"}
 
 
 def figura_perfil(p, res, curvas=("geod", "hid", "maop"), verifs=None, alto=620, titulo=None):
@@ -275,6 +283,7 @@ def figura_perfil(p, res, curvas=("geod", "hid", "maop"), verifs=None, alto=620,
     total = sum(len(t.puntos) for t in p.tramos)
     Sc = go.Scattergl if total > 4000 else go.Scatter
     ya = set()
+    minimos = m.presion_minima_recibo(p, res) if "minima" in curvas else []
     tols = sorted({v["tolerancia_pct"] for v in (verifs or {}).values() if v["tolerancia_pct"] > 0}) \
         if "perfiles" in curvas else []
 
@@ -316,6 +325,23 @@ def figura_perfil(p, res, curvas=("geod", "hid", "maop"), verifs=None, alto=620,
                                  line=dict(color="#FF0000", width=1, dash="dot"),
                                  hovertemplate=f"km %{{x:.3f}}<br>P. diseño + {tol:g} % %{{y:,.1f}} psig"
                                                "<extra></extra>"))
+        if minimos and minimos[k].get("p_min") is not None:
+            d = minimos[k]
+            interna = "hid" not in curvas
+            ym = [y - j for y, j in zip(d["linea_minima"], r.J)] if interna else d["linea_minima"]
+            fig.add_trace(Sc(x=km, y=ym, name="Línea mínima sin descuelgue (psig)", legendgroup="mn",
+                             showlegend=ley("mn"), line=dict(color="#00B050", width=1.6, dash="dash"),
+                             hovertemplate="km %{x:.3f}<br>Línea mínima %{y:,.1f} psig<extra></extra>"))
+            yc = d["margen_psi"] + (0 if interna else d["altura_critica"] * p.densidad * m.PSI_POR_M_KGM3)
+            fig.add_trace(go.Scatter(
+                x=[d["km_critico"]], y=[yc], mode="markers+text", name="Punto crítico de descuelgue",
+                legendgroup="pc", showlegend=ley("pc"), text=[f"P. mín. recibo {d['p_min']:,.0f}"],
+                textposition="bottom right", textfont=dict(size=10, color="#00703C"),
+                marker=dict(symbol="triangle-up", size=13, color="#00B050", line=dict(color="black", width=1)),
+                hovertemplate=(f"PUNTO CRÍTICO DE DESCUELGUE<br>km {d['km_critico']:.3f}  cota "
+                               f"{d['altura_critica']:,.1f} m<br>{html.escape(str(d['punto_critico'] or ''))}"
+                               f"<br>P. mín. recibo {d['estacion']}: {d['p_min']:,.2f} psig "
+                               f"({d['p_min_m']:,.1f} m)<extra></extra>")))
         rot = [j for j, s in enumerate(r.S) if s]
         if rot and ("hid" in curvas or "pint" in curvas):
             ycur = r.N if "hid" in curvas else r.O
@@ -371,6 +397,58 @@ def figura_perfil(p, res, curvas=("geod", "hid", "maop"), verifs=None, alto=620,
     return fig
 
 
+def seccion_descuelgue(p, res):
+    """Presión mínima de recibo en cada estación para que la línea no se descuelgue."""
+    mins = m.presion_minima_recibo(p, res)
+    validos = [d for d in mins if d.get("p_min") is not None]
+    hay = any(d["descuelga"] for d in validos)
+    with st.expander("🔻 Presión mínima de recibo para evitar descuelgue" + (" — ⚠️ HAY DESCUELGUE" if hay else ""),
+                     expanded=hay):
+        st.caption("Con el caudal, %DR y producto actuales: menor presión de recibo con la que la presión convertida "
+                   "a cabeza (m) alcanza para pasar el punto más alto del tramo que llega a la estación. "
+                   "P mín = máx[ P geodésica(i) + margen − pérdidas por fricción de i al recibo ] − P geodésica(recibo).")
+        c1, c2 = st.columns([1, 3])
+        marg = c1.number_input("Margen contra descuelgue (psi)", min_value=0.0, step=5.0, format="%.2f",
+                               value=float(getattr(p, "margen_descuelgue_psi", 0.0) or 0.0),
+                               key=f"w_margen_{ss.sistema}_{ss.ver}", help=AYUDA["margen_desc"])
+        if abs(marg - float(getattr(p, "margen_descuelgue_psi", 0.0) or 0.0)) > 1e-12:
+            p.margen_descuelgue_psi = marg
+            marcar()
+            ss.ver += 1
+            st.rerun()
+        filas = []
+        for d in validos:
+            filas.append({
+                "Estación (recibo)": d["estacion"] + (" (bypass)" if d["bypass"] else ""),
+                "P. mín. recibo (psig)": d["p_min"], "P. mín. recibo (m)": d["p_min_m"],
+                "P. recibo actual (psig)": d["p_actual"], "Holgura (psi)": d["holgura"],
+                "Estado": (f"⚠️ Se descuelga ({d['n_descuelgue']} puntos, km {d['km_descuelgue'][0]:.3f}–"
+                           f"{d['km_descuelgue'][1]:.3f})" if d["km_descuelgue"] else "⚠️ Se descuelga")
+                if d["descuelga"] else "✅ Sin descuelgue",
+                "km punto crítico": d["km_critico"], "Punto crítico": d["punto_critico"] or "",
+                "Cota crítica (m)": d["altura_critica"],
+                "Descarga necesaria con el recibo mínimo (psig)": d["descarga_con_minimo"]})
+        if filas:
+            st.dataframe(pd.DataFrame(filas).style.format(
+                {"P. mín. recibo (psig)": "{:,.2f}", "P. mín. recibo (m)": "{:,.1f}", "P. recibo actual (psig)": "{:,.2f}",
+                 "Holgura (psi)": "{:,.2f}", "km punto crítico": "{:.3f}", "Cota crítica (m)": "{:,.1f}",
+                 "Descarga necesaria con el recibo mínimo (psig)": "{:,.1f}"}),
+                use_container_width=True, hide_index=True)
+        aplicables = [(i + 1, d) for i, d in enumerate(mins) if d.get("p_min") is not None and not d["bypass"]]
+        if aplicables:
+            sel = c2.multiselect("Fijar la presión de recibo en su mínimo (redondeado hacia arriba a 0,1 psi)",
+                                 [d["estacion"] for _, d in aplicables], key=f"apl_min_{ss.sistema}_{ss.ver}")
+            if sel and c2.button("Aplicar presión mínima de recibo"):
+                for k, d in aplicables:
+                    if d["estacion"] in sel:
+                        p.estaciones[k].presion_recibo = math.ceil(max(d["p_min"], 0.0) * 10 - 1e-9) / 10
+                marcar()
+                ss.ver += 1
+                st.rerun()
+        st.caption("También puede usar 🎯 Buscar objetivo: *Descuelgue – estación = 0* cambiando la presión de recibo "
+                   "(da el mismo valor) o cambiando el flujo (caudal mínimo sin descuelgue).")
+
+
 def mensaje_verif(nom, v):
     """Mensaje de verificación de un perfil: máximo % de exceso, km y tolerancia."""
     if v["n_puntos"] == 0:
@@ -420,7 +498,8 @@ def html_resumen(p, res):
              + "</tr></table>")
     cols = ["Inicio Segmento", "Ubicación (km)", "Presión recibo (psig)", "Presión descarga (psig)", "Flujo (Kbdo)",
             "Rotura de tubo", "Lleno de línea (kbls)", "Tramo", "Presión Int remanente psig (Descuelgue)",
-            "INYECCIÓN", "Bypass"]
+            "INYECCIÓN", "Bypass", "P. mín. recibo sin descuelgue (psig)", "Holgura recibo (psi)"]
+    mins = m.presion_minima_recibo(p, res)
     h.append('<table class="xl"><tr>' + "".join(f"<th>{c}</th>" for c in cols) + "</tr>")
     for i, e in enumerate(p.estaciones):
         r = res[i] if i < n else None
@@ -439,6 +518,12 @@ def html_resumen(p, res):
             fila += celda("", "out") * 6 + celda("", "vacio")
         fila += celda("Sí" if e.paso_directo else ("No" if 0 < i < n else ""), "in" if 0 < i < n else "vacio",
                       AYUDA["bypass"])
+        d = mins[i - 1] if 0 < i <= len(mins) else {}
+        if d.get("p_min") is not None:
+            fila += (celda(d["p_min"], "out", AYUDA["p_min_recibo"])
+                     + celda(d["holgura"], "des" if d["descuelga"] else "out", AYUDA["holgura"]))
+        else:
+            fila += celda("", "vacio") * 2
         h.append(f"<tr>{fila}</tr>")
     h.append("<tr>" + celda("Total (km)", "lbl") + celda(kms[-1], "out") + '<td class="vacio" colspan="3"></td>'
              + celda("Line fill", "lbl") + celda(sum(r.lleno_kbls for r in res), "out")
@@ -684,8 +769,9 @@ with tabs[0]:
     if rot:
         st.error(f"⚠️ {rot} puntos con rotura de tubo. " + ", ".join(
             f"{p.estaciones[i].nombre}: {r.roturas}" for i, r in enumerate(res) if r.roturas))
+    seccion_descuelgue(p, res)
     verifs = verificaciones(p, res)
-    opciones = ["geod", "hid", "maop", "pint", "barlow"] + (["perfiles"] if p.perfiles_externos else [])
+    opciones = ["geod", "hid", "maop", "pint", "barlow", "minima"] + (["perfiles"] if p.perfiles_externos else [])
     defecto = ["geod", "hid", "maop"] + (["barlow", "perfiles"] if p.perfiles_externos else [])
     curvas = st.multiselect("Curvas del gráfico", opciones, default=defecto, format_func=lambda k: CURVAS[k],
                             key=f"curvas_{ss.sistema}_{len(p.perfiles_externos)}",
@@ -1052,6 +1138,9 @@ with tabs[8]:
    seguridad de SPS) y el programa calcula, punto a punto, cuánto superan la presión de diseño (psi y %), el máximo y
    los km donde ocurre; en transitorios se permite hasta el 10 % (editable). En el gráfico del
    Resumen puede agregar la Presión interna, la Presión de diseño y los perfiles cargados.
+4b. **Presión mínima de recibo (descuelgue)**: en la hoja Resumen, columnas *P. mín. recibo sin descuelgue* y
+   *Holgura*, y el panel 🔻 con el punto crítico (km, cota), el recibo mínimo en psig y en metros de columna, la descarga
+   necesaria y un botón para aplicarla. La curva *Línea mínima sin descuelgue* la muestra en el gráfico.
 5. **Tramos**: perfil completo de cada tramo. Las columnas ✏️ se pueden editar o pegar desde Excel.
 6. **Actualizar espesores**: por rango de km o con un archivo de rangos de una inspección.
 7. **💾 Guardar**: guarda en la base de datos compartida y registra los cambios en el **Historial**. Si otro

@@ -116,6 +116,7 @@ class Proyecto:
     productos: list = field(default_factory=lambda: [list(p) for p in PRODUCTOS_DEFECTO])
     km_interpolar: list = field(default_factory=lambda: [5, 20, 90, 100])
     perfiles_externos: list = field(default_factory=list)   # perfiles MOP / transitorios cargados
+    margen_descuelgue_psi: float = 0.0   # presión interna mínima exigida contra descuelgue (0 = cabeza = altura)
 
     # ---------------- serialización ----------------
     def to_dict(self):
@@ -251,18 +252,21 @@ def calcular_tramo(tramo: Tramo, flujo_kbd, densidad, visc_cst, dr, fr, presion_
 
     # Presión int+geod: se calcula de aguas abajo hacia aguas arriba
     N = [0.0] * n
+    R = [False] * n                  # descuelgue: la línea no alcanza la cota del punto (columna separada)
     N[-1] = J[-1] + presion_recibo
+    R[-1] = presion_recibo < 0
     for i in range(n - 2, -1, -1):
         e0, e1 = tramo.puntos[i].km, tramo.puntos[i + 1].km
         if e0 == e1:
             N[i] = N[i + 1]
+            R[i] = R[i + 1]
         else:
             cand = N[i + 1] + (e1 - e0) * M[i]
             N[i] = cand if cand > J[i] else J[i]
+            R[i] = cand < J[i] - 1e-9
 
     O = [N[i] - J[i] for i in range(n)]
     Q = [J[i] + P[i] for i in range(n)]
-    R = [N[i] < J[i] for i in range(n)]
     S = [P[i] < O[i] * fr for i in range(n)]
 
     T = [0.0] * n
@@ -845,6 +849,70 @@ def verificar_perfil(proy, res, perfil, tolerancia_pct=None):
         "uso_max_pct": (100 + peor[5]) if peor else None, "km_uso_max": peor[0] if peor else None,
         "puntos": puntos,
     }
+
+
+# --------------------------------------------------------------------------
+# PRESIÓN MÍNIMA DE RECIBO PARA EVITAR DESCUELGUE (columna separada / slack flow)
+# --------------------------------------------------------------------------
+def psi_a_m(psi, densidad):
+    """Convierte presión (psi) a cabeza de líquido (m) con la densidad del producto."""
+    k = densidad * PSI_POR_M_KGM3
+    return psi / k if k else 0.0
+
+
+def presion_minima_recibo(proy: Proyecto, res, margen_psi=None):
+    """Para cada tramo calcula la presión de recibo mínima (en la estación de llegada) para que la línea
+    no se descuelgue: la presión interna convertida a cabeza alcanza justo para pasar el punto más alto
+    (presión interna = margen en el punto crítico y ≥ margen en todo el tramo).
+
+    Con el caudal y %DR actuales la pérdida por fricción no depende de la presión de recibo, así que:
+        N(i) = J(fin) + P_recibo + F(i)      F(i) = pérdida por fricción acumulada desde i hasta el recibo
+        sin descuelgue  ⇔  N(i) − J(i) ≥ margen  en todos los puntos
+        P_recibo mín = max_i [ J(i) + margen − F(i) ] − J(fin)
+    Devuelve una lista (una entrada por tramo, i.e. por estación de recibo 1..n) de dicts.
+    """
+    margen = float(getattr(proy, "margen_descuelgue_psi", 0.0) or 0.0) if margen_psi is None else float(margen_psi)
+    salida = []
+    for i, (t, r) in enumerate(zip(proy.tramos, res)):
+        n = len(t.puntos)
+        est = proy.estaciones[i + 1] if i + 1 < len(proy.estaciones) else None
+        d = {"tramo": t.nombre, "estacion": est.nombre if est else "", "bypass": bool(est and est.paso_directo),
+             "margen_psi": margen, "p_min": None}
+        if n == 0 or not r.J:
+            salida.append(d)
+            continue
+        J, M = r.J, r.M
+        F = [0.0] * n
+        for k in range(n - 2, -1, -1):
+            e0, e1 = t.puntos[k].km, t.puntos[k + 1].km
+            F[k] = F[k + 1] if e0 == e1 else F[k + 1] + (e1 - e0) * M[k]
+        req = [J[k] + margen - F[k] for k in range(n)]
+        kc = max(range(n), key=lambda k: (req[k], -k))        # punto crítico (el primero si hay empate)
+        p_min = req[kc] - J[-1]
+        p_act = r.presion_recibo
+        # puntos que hoy quedan en descuelgue (la presión interna calculada sería menor que el margen)
+        N, desc = J[-1] + p_act, []
+        for k in range(n - 2, -1, -1):
+            e0, e1 = t.puntos[k].km, t.puntos[k + 1].km
+            cand = N if e0 == e1 else N + (e1 - e0) * M[k]
+            if cand - J[k] < margen - 1e-9:
+                desc.append(k)
+            N = max(cand, J[k])
+        pc = t.puntos[kc]
+        d.update({
+            "p_min": p_min, "p_min_m": psi_a_m(p_min, proy.densidad),
+            "p_actual": p_act, "p_actual_m": psi_a_m(p_act, proy.densidad), "holgura": p_act - p_min,
+            "holgura_m": psi_a_m(p_act - p_min, proy.densidad), "descuelga": p_act < p_min - 1e-6,
+            "km_critico": pc.km, "punto_critico": pc.punto, "altura_critica": pc.altura,
+            "altura_recibo": t.puntos[-1].altura,
+            "descarga_con_minimo": p_min + J[-1] + F[0] - J[0],
+            "n_descuelgue": len(desc),
+            "km_descuelgue": (min(t.puntos[k].km for k in desc), max(t.puntos[k].km for k in desc)) if desc else None,
+            # línea int+geod con el recibo mínimo (toca el terreno en el punto crítico)
+            "linea_minima": [J[-1] + p_min + F[k] for k in range(n)],
+        })
+        salida.append(d)
+    return salida
 
 # --------------------------------------------------------------------------
 # Importación desde la plantilla Excel
@@ -1538,14 +1606,16 @@ def diferencias(viejo: Proyecto, nuevo: Proyecto):
     """Lista de cambios (tramo, km, campo, anterior, nuevo) entre dos versiones de un sistema."""
     cambios = []
     for campo, et in [("flujo_kbd", "Flujo (KBDO)"), ("producto", "Producto"), ("iny1_bph", "INY 1 (bph)"),
-                      ("iny2_bph", "INY 2 (bph)"), ("densidad", "Densidad"), ("viscosidad", "Viscosidad")]:
-        a, b = getattr(viejo, campo), getattr(nuevo, campo)
+                      ("iny2_bph", "INY 2 (bph)"), ("densidad", "Densidad"), ("viscosidad", "Viscosidad"),
+                      ("margen_descuelgue_psi", "Margen contra descuelgue (psi)")]:
+        a, b = getattr(viejo, campo, 0.0), getattr(nuevo, campo, 0.0)
         if a != b:
             cambios.append(("", None, et, _fmt_hist(a), _fmt_hist(b)))
     for eo, en in zip(viejo.estaciones, nuevo.estaciones):
         for campo, et in [("nombre", "Nombre"), ("presion_recibo", "Presión recibo"), ("paso_directo", "Bypass"),
-                          ("dr", "%DR"), ("fr", "FR"), ("inyeccion", "Inyección")]:
-            a, b = getattr(eo, campo), getattr(en, campo)
+                          ("dr", "%DR"), ("fr", "FR"), ("inyeccion", "Inyección"),
+                          ("delta_bph", "Iny(+)/Entrega(−) bph")]:
+            a, b = getattr(eo, campo, 0.0), getattr(en, campo, 0.0)
             if campo == "presion_recibo" and en.paso_directo:
                 continue
             if a != b:
