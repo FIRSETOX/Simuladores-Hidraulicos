@@ -285,7 +285,7 @@ def flujos_por_tramo(proy: Proyecto):
             f = prev + proy.iny2_bph * BPH_A_KBD
         elif est.inyeccion == "INY 1":
             f = prev + proy.iny1_bph * BPH_A_KBD
-        f += (est.delta_bph or 0.0) * BPH_A_KBD
+        f += (getattr(est, "delta_bph", 0.0) or 0.0) * BPH_A_KBD
         flujos.append(f)
         prev = f
     return flujos

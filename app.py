@@ -4,6 +4,7 @@ Generación de perfiles hidráulicos para priorización ILI - multisistema y mul
 
 Ejecutar en el computador:   streamlit run app.py
 """
+import dataclasses
 import html
 import io
 
@@ -95,7 +96,45 @@ def marcar():
     ss.modificado = True
 
 
+VERSION_CODIGO = "2026-10-19b"
+
+
+def motor_desactualizado():
+    """True si motor.py en el servidor es más viejo que app.py (no se subió el motor.py nuevo)."""
+    campos_est = {f.name for f in dataclasses.fields(m.Estacion)}
+    campos_proy = {f.name for f in dataclasses.fields(m.Proyecto)}
+    return ("delta_bph" not in campos_est or "perfiles_externos" not in campos_proy
+            or not hasattr(m, "tolerancia_perfil"))
+
+
 def inicializar():
+    if motor_desactualizado():
+        st.error("⚠️ El archivo **motor.py** del servidor está desactualizado respecto a **app.py**. Suba a GitHub "
+                 "el motor.py nuevo (junto con app.py) y recargue la página.")
+        st.stop()
+    # objetos creados con una versión anterior del código (sesión abierta durante una actualización):
+    # se vuelve a cargar el sistema desde la base de datos para que tengan todos los campos nuevos.
+    if "proy" in ss and ss.get("version_codigo") != VERSION_CODIGO:
+        sist = ss.get("sistema")
+        datos = None
+        if ss.get("modificado"):
+            try:
+                datos = m.Proyecto.from_dict(m.asdict(ss.proy))   # conserva los cambios sin guardar
+            except Exception:  # noqa: BLE001
+                datos = None
+        for k in list(ss.keys()):
+            del ss[k]
+        ss.version_codigo = VERSION_CODIGO
+        ss.cambios, ss.modificado, ss.ver = [], False, 0
+        sistemas = bd().sistemas()
+        if sist in sistemas or sistemas:
+            cargar_sistema(sist if sist in sistemas else sistemas[0])
+        if datos is not None and ss.get("sistema") == sist:
+            datos.productos = ss.proy.productos
+            ss.proy, ss.modificado = datos, True
+        if "proy" in ss:
+            return
+    ss.version_codigo = VERSION_CODIGO
     if "proy" in ss:
         return
     sistemas = bd().sistemas()
@@ -598,7 +637,7 @@ with tabs[0]:
         "%DR": [e.dr if i < n else None for i, e in enumerate(p.estaciones)],
         "FR": [e.fr if i < n else None for i, e in enumerate(p.estaciones)],
         "Inyección": [e.inyeccion if i < n else None for i, e in enumerate(p.estaciones)],
-        "Iny(+)/Entrega(−) bph": [e.delta_bph if 0 < i < n else None for i, e in enumerate(p.estaciones)],
+        "Iny(+)/Entrega(−) bph": [getattr(e, "delta_bph", 0.0) if 0 < i < n else None for i, e in enumerate(p.estaciones)],
     })
     ed = st.data_editor(
         df_est, key=f"ed_est_{ss.ver}", hide_index=True, use_container_width=True, num_rows="fixed",
@@ -632,7 +671,7 @@ with tabs[0]:
             if fila["Inyección"] in m.INYECCIONES and fila["Inyección"] != e.inyeccion:
                 e.inyeccion, cambio = fila["Inyección"], True
             v = fila["Iny(+)/Entrega(−) bph"]
-            if i > 0 and pd.notna(v) and float(v) != e.delta_bph:
+            if i > 0 and pd.notna(v) and float(v) != getattr(e, "delta_bph", 0.0):
                 e.delta_bph, cambio = float(v), True
     if cambio:
         marcar()
