@@ -23,7 +23,8 @@ REQUERIDOS_MOTOR = ("presion_minima_recibo", "tolerancia_perfil", "verificar_per
                     "buscar_objetivo", "importar_plantilla_excel", "simular_fuga", "calcular_red", "proyecto_ruta",
                     "rutas_red", "Ramal", "posiciones_esquema", "subred_ramal",
                     "nombres_curva", "flujo_operacion", "curva_entre_estaciones",
-                    "flujo_en_estacion")
+                    "flujo_en_estacion", "curva_trayecto", "trayectos_red", "barrido_reparto",
+                    "comparar_valvulas", "VALVULAS")
 
 
 def _motor_incompleto():
@@ -32,6 +33,8 @@ def _motor_incompleto():
     campos_proy = {f.name for f in dataclasses.fields(m.Proyecto)}
     faltan += [c for c in ("delta_bph", "clientes") if c not in campos_est]
     faltan += [c for c in ("perfiles_externos", "margen_descuelgue_psi", "ramales") if c not in campos_proy]
+    if hasattr(m, "Ramal") and "valvula" not in {f.name for f in dataclasses.fields(m.Ramal)}:
+        faltan.append("Ramal.valvula")
     return faltan
 
 
@@ -127,7 +130,7 @@ def marcar():
     ss.modificado = True
 
 
-VERSION_CODIGO = "2026-10-20c"
+VERSION_CODIGO = "2026-10-20e"
 
 
 def motor_desactualizado():
@@ -716,6 +719,19 @@ c[2].text_input("Responsable elaboración", key="w_resp", on_change=cb_simple, a
 COLORES_RAMAL = ["#2E75B6", "#C55A11", "#548235", "#7030A0", "#BF8F00", "#00838F", "#AD1457"]
 
 
+def texto_valvula(inf):
+    """Descripción de la válvula de control de un ramal (dónde está y cuánto estrangula)."""
+    v = inf.get("valvula") or {}
+    if inf["ramal"].modo == "Hidráulico":
+        return "— (reparto hidráulico, sin válvula)"
+    if v.get("lugar") == "Nodo":
+        if (v.get("estrangula") or 0) <= 0.05:
+            return f"en el nodo {v.get('estacion', '')}: no necesita estrangular"
+        return f"en el nodo {v.get('estacion', '')}: estrangula {v['estrangula']:,.1f} psi hacia la {v.get('rama', '')}"
+    return (f"en {v.get('estacion', '')}: llega a {v['p_antes']:,.1f} psig y la válvula baja a {v['recibo']:,.1f} "
+            f"(estrangula {v['estrangula']:,.1f} psi)")
+
+
 def nombre_cadena(p, cad):
     return "Línea principal" if not cad else f"Ramal {cad}"
 
@@ -1029,7 +1045,8 @@ with tabs[0]:
     if getattr(res, "red", None):
         st.info("🔀 Este sistema tiene ramales: " + "; ".join(
             f"**{nom}** se lleva {inf['flujo']:,.2f} KBDO ({inf['pct_calculado']:.1f} %) en "
-            f"{m.cadena_de(p, inf['ramal'].padre).estaciones[inf['ramal'].nodo].nombre}"
+            f"{m.cadena_de(p, inf['ramal'].padre).estaciones[inf['ramal'].nodo].nombre} – válvula "
+            f"{texto_valvula(inf)}"
             for nom, inf in res.red.items()) + ". La tabla muestra la línea principal; vea la pestaña *Red / ramales*.")
     st.markdown(html_resumen(p, res), unsafe_allow_html=True)
     rot = sum(r.roturas for r in res)
@@ -1095,9 +1112,7 @@ with tab_red:
                           "Presión en el nodo (psig)": inf["p_nodo"],
                           "P. que pide la línea (psig)": float("nan") if inf["d_padre"] is None else inf["d_padre"],
                           "P. que pide el ramal (psig)": inf["d_ramal"],
-                          "Válvula de control": ("—" if ram.modo == "Hidráulico" else
-                                                 (f"estrangula {er:,.1f} psi en el ramal" if (er or 0) > 0.05 else
-                                                  (f"estrangula {ep:,.1f} psi en la línea" if (ep or 0) > 0.05 else "—"))),
+                          "Válvula de control": texto_valvula(inf),
                           "Nodo": "bombea (cabezal)" if inf.get("nodo_bombea") else "bypass (sin bombeo)",
                           "Nota": inf.get("nota", "")})
         st.dataframe(pd.DataFrame(filas).style.format(precision=2, na_rep="—"), use_container_width=True,
@@ -1219,8 +1234,105 @@ with tab_red:
                 marcar()
                 ss.ver += 1
                 st.rerun()
+        if ram.modo != "Hidráulico":
+            v1, v2 = st.columns([1.6, 3])
+            val_n = v1.selectbox("Válvula de control (PCV / FCV)", m.VALVULAS,
+                                 index=m.VALVULAS.index(ram.valvula) if ram.valvula in m.VALVULAS else 0,
+                                 format_func=lambda x: m.VALVULAS_TEXTO[x], key=f"ram_val_{rsel}_{ss.ver}",
+                                 help="Dónde se controla el reparto. En el nodo: la rama a la que le sobra presión se "
+                                      "estrangula a la salida del nodo. En la llegada: esa rama trabaja con más presión "
+                                      "en todo su recorrido y la válvula de la estación de llegada baja a su presión de "
+                                      "recibo (cambia el perfil, las roturas y el descuelgue).")
+            if val_n != ram.valvula:
+                ram.valvula = val_n
+                marcar()
+                ss.ver += 1
+                st.rerun()
+            if inf:
+                v2.markdown(f"<br>**Válvula de control:** {html.escape(texto_valvula(inf))}", unsafe_allow_html=True)
         if inf.get("nota"):
             st.warning(inf["nota"])
+        with st.expander("📊 Análisis del reparto y de la ubicación de la válvula de control"):
+            st.caption("Para cada % del flujo hacia el ramal: presión en el nodo, qué rama hay que estrangular y "
+                       "cuánto, y con qué presión llegaría esa rama a su estación si la válvula está allá. La línea "
+                       "verde marca el reparto natural (sin válvula, por hidráulica).")
+            clave_b = f"barrido_{ss.sistema}_{rsel}"
+            if st.button("Calcular análisis", key=f"btn_{clave_b}_{ss.ver}"):
+                with st.spinner("Calculando…"):
+                    ss[clave_b] = (ss.ver, m.barrido_reparto(p, rsel), m.comparar_valvulas(p, rsel))
+            dato = ss.get(clave_b)
+            if dato and dato[0] != ss.ver:
+                st.info("Los datos cambiaron: vuelva a calcular el análisis.")
+            if dato:
+                _, bar, comp = dato
+                fb = pd.DataFrame([{
+                    "% hacia el ramal": f_["pct"], "Flujo ramal (KBDO)": f_["flujo_ramal"],
+                    "Flujo que sigue (KBDO)": f_["flujo_linea"], "Presión en el nodo (psig)": f_["p_nodo"],
+                    "Pide la línea (psig)": f_["d_padre"], "Pide el ramal (psig)": f_["d_ramal"],
+                    "Estrangular en": f_["rama_estrangula"], "ΔP (psi)": f_["estrangula"],
+                    "Válvula en la llegada": f_["valvula_llegada"] or "",
+                    "Llega antes de la válvula (psig)": f_["p_antes_llegada"],
+                    "P. int. máx. línea – válv. nodo": f_["pmax_linea_nodo"],
+                    "P. int. máx. línea – válv. llegada": f_["pmax_linea_llegada"],
+                    "P. int. máx. ramal – válv. nodo": f_["pmax_ramal_nodo"],
+                    "P. int. máx. ramal – válv. llegada": f_["pmax_ramal_llegada"],
+                    "Roturas (nodo / llegada)": f"{f_['roturas_linea_nodo'] + f_['roturas_ramal_nodo']} / "
+                                                f"{f_['roturas_linea_llegada'] + f_['roturas_ramal_llegada']}",
+                    "Descuelgues (nodo / llegada)": f"{f_['descuelgues_linea_nodo'] + f_['descuelgues_ramal_nodo']} / "
+                                                    f"{f_['descuelgues_linea_llegada'] + f_['descuelgues_ramal_llegada']}"}
+                    for f_ in bar["filas"]])
+                figb = go.Figure()
+                for col, color, dash in (("Presión en el nodo (psig)", AZUL, "solid"), ("Pide la línea (psig)", "#C55A11", "dot"),
+                                         ("Pide el ramal (psig)", "#548235", "dot")):
+                    figb.add_trace(go.Scatter(x=fb["% hacia el ramal"], y=fb[col], name=col, mode="lines+markers",
+                                              line=dict(color=color, dash=dash)))
+                for est_v, color in zip([x for x in dict.fromkeys(fb["Válvula en la llegada"]) if x],
+                                        ("#7030A0", "#BF8F00", "#00838F")):
+                    sub_v = fb[fb["Válvula en la llegada"] == est_v]
+                    figb.add_trace(go.Scatter(x=sub_v["% hacia el ramal"], y=sub_v["Llega antes de la válvula (psig)"],
+                                              name=f"Llega a {est_v} antes de su válvula (psig)", mode="lines+markers",
+                                              line=dict(color=color, dash="dash")))
+                if bar["natural"] is not None:
+                    figb.add_vline(x=bar["natural"], line=dict(color="green", dash="dash"),
+                                   annotation_text=f"Reparto natural {bar['natural']:.1f} %")
+                figb.add_vline(x=ram.pct, line=dict(color="gray", dash="dot"), annotation_text=f"Actual {ram.pct:g} %",
+                               annotation_position="bottom right")
+                figb.update_layout(template="plotly_white", height=430, xaxis_title=f"% del flujo hacia {rsel}",
+                                   yaxis_title="Presión (psig)", legend=dict(orientation="h", y=-0.25),
+                                   title="Reparto del flujo y presión en el nodo")
+                st.plotly_chart(figb, use_container_width=True, config={"displaylogo": False})
+                st.dataframe(fb.style.format(precision=1, na_rep=""), use_container_width=True, hide_index=True)
+                st.markdown(f"**Comparación de la ubicación de la válvula con el {ram.pct:g} % actual** "
+                            "(aguas abajo del nodo)")
+                fc = pd.DataFrame([{
+                    "Válvula": m.VALVULAS_TEXTO[lug], "Posible": "Sí" if ok else "No (se usa el nodo)",
+                    "Detalle": texto_valvula(inf_c), "Presión en el nodo (psig)": inf_c["p_nodo"],
+                    "P. int. máx. línea (psig)": mt["pmax_linea"], "P. int. mín. línea (psig)": mt["pmin_linea"],
+                    "P. int. máx. ramal (psig)": mt["pmax_ramal"], "P. int. mín. ramal (psig)": mt["pmin_ramal"],
+                    "Roturas línea / ramal": f"{mt['roturas_linea']} / {mt['roturas_ramal']}",
+                    "Descuelgues línea / ramal": f"{mt['descuelgues_linea']} / {mt['descuelgues_ramal']}"}
+                    for lug, _r, inf_c, mt, ok in comp])
+                st.dataframe(fc.style.format(precision=1, na_rep=""), use_container_width=True, hide_index=True)
+                rutas_c = m.rutas_red(p)
+                k_rc = st.radio("Ruta del perfil", range(len(rutas_c)), format_func=lambda k: rutas_c[k][0],
+                                horizontal=True, key=f"rc_{clave_b}")
+                figv = None
+                colores_v = {"Nodo": AZUL, "Llegada línea": "#C55A11", "Llegada ramal": "#548235"}
+                for lug, res_c, inf_c, mt, ok in comp:
+                    if not ok:
+                        continue
+                    pr_c, rr_c = m.proyecto_ruta(p, res_c, rutas_c[k_rc][1])
+                    if figv is None:
+                        figv = figura_perfil(pr_c, rr_c, ["geod", "maop"],
+                                             titulo=f"Perfil con la válvula en cada ubicación – {rutas_c[k_rc][0]}")
+                    for kk, (t_, r_) in enumerate(zip(pr_c.tramos, rr_c)):
+                        figv.add_trace(go.Scatter(x=[x.km for x in t_.puntos], y=r_.N, mode="lines",
+                                                  name=f"Presión int+geod – válvula {m.VALVULAS_TEXTO[lug].lower()}",
+                                                  legendgroup=lug, showlegend=(kk == 0),
+                                                  line=dict(color=colores_v[lug], width=2,
+                                                            dash="solid" if lug == "Nodo" else "dash")))
+                if figv is not None:
+                    st.plotly_chart(figv, use_container_width=True, config={"displaylogo": False})
         st.markdown("**Estaciones del ramal** (la primera es el nodo de derivación: su %DR y FR aplican al primer "
                     "tramo del ramal)")
         n_r = len(ram.tramos)
@@ -1718,39 +1830,41 @@ with tabs[5]:
                       key=f"curva_tipo_{ss.sistema}",
                       help="Entre dos estaciones: presión de descarga necesaria en la estación inicial para llevar "
                            "el caudal hasta la estación final con su presión de recibo (p.ej. Sutamarchán → Miraflores).")
-    if p.ramales or tipo_c.startswith("Entre"):
+    entre = tipo_c.startswith("Entre")
+    if p.ramales and not entre:
         lin_c = st.radio("Línea", lineas_c, horizontal=True, key=f"curva_lin_{ss.sistema}",
-                         format_func=lambda x: "Línea principal" + ("" if tipo_c.startswith("Entre")
-                                                                    else " (flujo que entra al sistema)") if not x
-                         else f"Ramal {x}" + ("" if tipo_c.startswith("Entre") else " (flujo que entra al ramal en su nodo)"))
+                         format_func=lambda x: "Línea principal (flujo que entra al sistema)" if not x
+                         else f"Ramal {x} (flujo que entra al ramal en su nodo)")
     else:
         lin_c = ""
     cad_c = m.cadena_de(p, lin_c)
-    entre = tipo_c.startswith("Entre")
     if entre:
-        nom_est = [e.nombre for e in cad_c.estaciones]
-        if lin_c and nom_est:
-            nom_est[0] = f"{nom_est[0]} (nodo)"
+        desde_l, hasta_d, _ = m.trayectos_red(p)
         e1, e2, e3, e4 = st.columns([1.5, 1.5, 1.2, 1.6])
-        ini_c = e1.selectbox("Desde la estación", range(len(nom_est) - 1), format_func=lambda k: nom_est[k],
-                             key=f"c_ini_{ss.sistema}_{lin_c}")
-        fin_ops = list(range(ini_c + 1, len(nom_est)))
-        fin_c = e2.selectbox("Hasta la estación", fin_ops, format_func=lambda k: nom_est[k],
-                             key=f"c_fin_{ss.sistema}_{lin_c}_{ini_c}")
-        rs_c = list(res) if not lin_c else list((getattr(res, "red", None) or {}).get(lin_c, {}).get("res", []))
-        rec_act = rs_c[fin_c - 1].presion_recibo if fin_c - 1 < len(rs_c) else cad_c.estaciones[fin_c].presion_recibo
-        rec_c = e3.number_input(f"Recibo en {cad_c.estaciones[fin_c].nombre} (psig)", value=float(round(rec_act, 2)),
-                                step=10.0, key=f"c_rec_{ss.sistema}_{lin_c}_{fin_c}")
+        ini_c = e1.selectbox("Desde la estación", range(len(desde_l)),
+                             format_func=lambda k: m.nombre_estacion_red(p, desde_l[k]), key=f"c_ini_{ss.sistema}",
+                             help="Cualquier estación de la red (línea principal o ramales).")
+        clave_ini = desde_l[ini_c]
+        fin_l = hasta_d[clave_ini]
+        fin_c = e2.selectbox("Hasta la estación", range(len(fin_l)),
+                             format_func=lambda k: m.nombre_estacion_red(p, fin_l[k]),
+                             key=f"c_fin_{ss.sistema}_{clave_ini}",
+                             help="Estaciones aguas abajo, por cualquier ruta (línea principal o ramales).")
+        clave_fin = fin_l[fin_c]
+        base_c = m.curva_trayecto(p, res, clave_ini, clave_fin, 0, 0, 1)
+        rec_c = e3.number_input(f"Recibo en {m.nombre_estacion_red(p, clave_fin)} (psig)",
+                                value=float(round(base_c["recibo_op"], 2)), step=10.0,
+                                key=f"c_rec_{ss.sistema}_{clave_ini}_{clave_fin}")
         sin_bomb = e4.checkbox("Sin bombeo en las estaciones intermedias", value=True,
-                               key=f"c_sb_{ss.sistema}_{lin_c}", disabled=fin_c - ini_c < 2,
+                               key=f"c_sb_{ss.sistema}", disabled=len(base_c["tramos"]) < 2,
                                help="Marcado: el trayecto se toma como una sola tubería (las estaciones intermedias no "
                                     "bombean). Sin marcar: las que bombean fijan su presión de recibo y se muestra la "
                                     "descarga de cada una.")
-        q_op = m.flujo_en_estacion(p, res, lin_c, ini_c) or 0.0
+        q_op = base_c["q_op"] or 0.0
     else:
         q_op = m.flujo_operacion(p, res, lin_c) or 0.0
     k = st.columns(4)
-    clave_c = f"{ss.sistema}_{lin_c}_{entre}_{ini_c if entre else ''}"
+    clave_c = f"{ss.sistema}_{lin_c}_{entre}_{desde_l[ini_c] if entre else ''}"
     li = k[0].number_input("Flujo mínimo (KBDO)", value=0.0, min_value=0.0, key=f"c_li_{clave_c}")
     ls = k[1].number_input("Flujo máximo (KBDO)", value=max(round(q_op * 1.25, 1), 100.0 if q_op <= 0 else 0.1),
                            min_value=0.1, key=f"c_ls_{clave_c}")
@@ -1763,13 +1877,14 @@ with tabs[5]:
                   "ramal y en sus estaciones (lo que deben dar las bombas que lo alimentan)." if p.ramales and not entre else "")
                + (" Entre dos estaciones se respetan las entregas/inyecciones intermedias; no se incluyen los ramales "
                   "que salgan de ellas." if entre else ""))
-    tramos_c = cad_c.tramos[ini_c:fin_c] if entre else cad_c.tramos
+    tramos_c = base_c["tramos"] if entre else cad_c.tramos
     if any(not t.puntos for t in tramos_c):
         st.warning("Hay tramos sin perfil: la curva solo es válida cuando todos tienen datos.")
     dr_c = 0.0 if modo.startswith("Sin") else None
     if entre:
-        curva, nombres_e = m.curva_entre_estaciones(p, lin_c, ini_c, fin_c, li, ls, int(pasos), dr_c, rec_c, sin_bomb)
-        titulo_c = f"{cad_c.estaciones[ini_c].nombre} → {cad_c.estaciones[fin_c].nombre} (recibo {rec_c:,.0f} psig)"
+        cr = m.curva_trayecto(p, res, clave_ini, clave_fin, li, ls, int(pasos), dr_c, rec_c, sin_bomb)
+        curva, nombres_e = cr["filas"], cr["nombres"]
+        titulo_c = f"{cr['titulo']} (recibo {rec_c:,.0f} psig)"
     else:
         curva = m.curva_sistema(p, li, ls, int(pasos), dr_c, lin_c)
         nombres_e = m.nombres_curva(p, lin_c)
@@ -1829,6 +1944,10 @@ with tabs[8]:
    de ahí): importe su plantilla Excel, cópielo de otro sistema o créelo vacío y pegue los perfiles. El flujo se reparte
    con un **% fijo** (válvula de control) o por **hidráulica** (con las presiones de recibo de cada destino). Muestra
    la presión en el nodo, cuánto estrangula la válvula y el perfil hidráulico de cada ruta.
+   En modo Porcentaje elija dónde está la **válvula de control**: en el nodo, en la llegada de la línea (p.ej. control
+   por flujo en Tocancipá) o en la llegada del ramal; el programa calcula con qué presión llega esa rama a su válvula.
+   El **Análisis del reparto** muestra, para 0–100 %, la presión en el nodo, dónde y cuánto estrangular, el reparto
+   natural sin válvula y compara los perfiles con la válvula en cada ubicación.
 4d. **💧 Fugas / válvula ilícita**: caudal que sale por una válvula ilícita o un derrame en un km (ecuación de orificio
    con la presión de la línea, recalculando la línea con la fuga), volumen perdido y cómo cambian las presiones y
    caudales en las estaciones (con caudal constante o con presión de descarga constante).

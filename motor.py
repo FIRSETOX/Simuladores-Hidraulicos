@@ -159,6 +159,12 @@ def tramos_desde(lista):
 
 
 MODOS_RAMAL = ("Porcentaje", "Hidráulico")
+# ubicación de la válvula de control en el modo Porcentaje
+VALVULAS = ("Nodo", "Llegada línea", "Llegada ramal", "Automático")
+VALVULAS_TEXTO = {"Nodo": "En el nodo (estrangula la rama que sobra)",
+                  "Llegada línea": "En la llegada de la línea que continúa",
+                  "Llegada ramal": "En la llegada del ramal",
+                  "Automático": "Automático: en la llegada de la rama que sobra"}
 
 
 @dataclass
@@ -175,13 +181,15 @@ class Ramal:
     nodo: int = 0                     # índice de la estación del padre donde se deriva
     modo: str = "Porcentaje"
     pct: float = 50.0
+    valvula: str = "Nodo"             # modo Porcentaje: dónde está la válvula de control (VALVULAS)
     estaciones: list = field(default_factory=list)
     tramos: list = field(default_factory=list)
 
     @staticmethod
     def from_dict(d):
         r = Ramal(nombre=d.get("nombre", "Ramal"), padre=d.get("padre", "") or "", nodo=int(d.get("nodo", 0)),
-                  modo=d.get("modo", "Porcentaje"), pct=float(d.get("pct", 50.0)))
+                  modo=d.get("modo", "Porcentaje"), pct=float(d.get("pct", 50.0)),
+                  valvula=d.get("valvula", "Nodo") or "Nodo")
         r.estaciones = estaciones_desde(d.get("estaciones", []))
         r.tramos = tramos_desde(d.get("tramos", []))
         return r
@@ -1297,17 +1305,22 @@ def _flujos_cadena(estaciones, n, q0, iny1, iny2, extraccion, ignorar_inicio=Fal
     return flujos, disp
 
 
-def _presiones_cadena(estaciones, tramos, flujos, dens, visc, req):
+def _presiones_cadena(estaciones, tramos, flujos, dens, visc, req, ajustes=None):
     """Igual que calcular_proyecto (de aguas abajo hacia aguas arriba) pero en una estación en bypass con
-    ramales, la presión del nodo es la mayor entre la que pide la línea y la que piden los ramales (req)."""
+    ramales, la presión del nodo es la mayor entre la que pide la línea y la que piden los ramales (req).
+    ajustes[k] = presión con la que llega el tramo a la estación k (aguas arriba de una válvula de control
+    ubicada en esa estación) en vez de su presión de recibo."""
     n = len(tramos)
     res = [None] * n
+    ajustes = ajustes or {}
     for i in range(n - 1, -1, -1):
         est_ini, est_fin = estaciones[i], estaciones[i + 1]
         if est_fin.paso_directo and i + 1 < n and res[i + 1] is not None:
             p_rec = res[i + 1].presion_descarga
             if i + 1 in req:
                 p_rec = max(p_rec, req[i + 1])
+        elif i + 1 in ajustes:
+            p_rec = ajustes[i + 1]
         else:
             p_rec = est_fin.presion_recibo
         res[i] = calcular_tramo(tramos[i], flujos[i], dens, visc, est_ini.dr, est_ini.fr, p_rec)
@@ -1318,8 +1331,18 @@ def _hijos(proy, nombre_padre):
     return [r for r in proy.ramales if (r.padre or "") == nombre_padre]
 
 
-def _evaluar(proy, cadena, nombre, q0, fracs, salida, es_ramal):
+def estacion_control(cadena, k):
+    """Primera estación aguas abajo de la estación k que fija su presión de recibo (no está en bypass)."""
+    n = len(cadena.tramos)
+    c = k + 1
+    while c < n and cadena.estaciones[c].paso_directo:
+        c += 1
+    return c
+
+
+def _evaluar(proy, cadena, nombre, q0, fracs, salida, es_ramal, ajustes=None):
     """Calcula una cadena (línea principal o ramal) y, recursivamente, sus ramales."""
+    ajustes = ajustes or {}
     n = len(cadena.tramos)
     hijos = [h for h in _hijos(proy, nombre) if 0 <= h.nodo <= n]
     ext = {}
@@ -1331,13 +1354,14 @@ def _evaluar(proy, cadena, nombre, q0, fracs, salida, es_ramal):
     req = {}
     for h in hijos:
         qh = fracs[h.nombre] * disp[h.nodo]
-        res_h = _evaluar(proy, h, h.nombre, qh, fracs, salida, True)
+        res_h = _evaluar(proy, h, h.nombre, qh, fracs, salida, True, ajustes)
         d_h = res_h[0].presion_descarga if res_h else None
         salida[h.nombre] = {"ramal": h, "res": res_h, "flujo": qh, "fraccion": fracs[h.nombre],
                             "disponible_nodo": disp[h.nodo], "d_ramal": d_h, "padre": nombre, "nodo": h.nodo}
         if d_h is not None:
             req[h.nodo] = max(req.get(h.nodo, -1e99), d_h)
-    res = _presiones_cadena(cadena.estaciones, cadena.tramos, flujos, proy.densidad, proy.viscosidad, req)
+    res = _presiones_cadena(cadena.estaciones, cadena.tramos, flujos, proy.densidad, proy.viscosidad, req,
+                            ajustes.get(nombre))
     for h in hijos:                                   # presión en el nodo y estrangulamiento
         info = salida[h.nombre]
         k = h.nodo
@@ -1367,9 +1391,11 @@ def calcular_red(proy: Proyecto, flujo_kbd=None, iteraciones=40):
     hidraulicos = [r for r in proy.ramales if r.modo == "Hidráulico"]
     notas = {}
 
+    ajustes = {}                                     # {cadena: {estación: presión antes de la válvula}}
+
     def evaluar_todo():
         salida = {}
-        res = _evaluar(proy, proy, "", q0, fracs, salida, False)
+        res = _evaluar(proy, proy, "", q0, fracs, salida, False, ajustes)
         return res, salida
 
     for _ in range(4 if len(hidraulicos) > 1 else 1):
@@ -1400,10 +1426,81 @@ def calcular_red(proy: Proyecto, flujo_kbd=None, iteraciones=40):
                 continue
             fracs[h.nombre] = _raiz(g, 0.0, 1.0, g0, g1, tol=1e-9, maxit=iteraciones)
             notas.pop(h.nombre, None)
+
+    # válvula de control en la llegada (modo Porcentaje): la presión con la que llega esa rama a su
+    # estación de control se sube hasta que pida en el nodo lo mismo que la otra rama (sin estrangular
+    # en el nodo); la válvula reduce de esa presión a la presión de recibo de la estación.
+    valvulas = {}
+    con_valvula = [r for r in proy.ramales if r.modo != "Hidráulico" and (r.valvula or "Nodo") != "Nodo"
+                   and (not r.padre or r.padre in nombres)]
+    for _ in range(3 if len(con_valvula) > 1 else 1):
+        for r in con_valvula:
+            padre = cadena_de(proy, r.padre)
+            for cad_nom in (r.padre or "", r.nombre):
+                ajustes.get(cad_nom, {}).pop(estacion_control(padre if cad_nom == (r.padre or "") else r,
+                                                              r.nodo if cad_nom == (r.padre or "") else 0), None)
+            res0, sal0 = evaluar_todo()
+            inf = sal0.get(r.nombre)
+            if not inf or inf["d_ramal"] is None:
+                continue
+            d_p, d_r = inf["d_padre"], inf["d_ramal"]
+            lugar = r.valvula
+            if lugar == "Automático":
+                lugar = "Llegada línea" if (d_p is not None and d_r >= d_p) else "Llegada ramal"
+            if lugar == "Llegada línea" and d_p is None:
+                valvulas[r.nombre] = {"nota": "La línea no continúa después del nodo: la válvula queda en el nodo."}
+                continue
+            if lugar == "Llegada línea":
+                cad_v, nom_v, k0, objetivo, actual = padre, r.padre or "", r.nodo, d_r, d_p
+            else:
+                cad_v, nom_v, k0, objetivo, actual = r, r.nombre, 0, d_p, d_r
+            c_est = estacion_control(cad_v, k0)
+            recibo = cad_v.estaciones[c_est].presion_recibo
+            if objetivo is None or objetivo <= actual + 1e-9:
+                otra = "del ramal" if lugar == "Llegada línea" else "de la línea"
+                valvulas[r.nombre] = {"lugar": lugar, "estacion": cad_v.estaciones[c_est].nombre, "factible": False,
+                                      "nota": (f"Con la válvula en {cad_v.estaciones[c_est].nombre} no se logra el "
+                                               f"{r.pct:g} %: esa rama ya pide más presión en el nodo que la otra. La "
+                                               f"válvula debe ir en el nodo o en la llegada {otra}.")}
+                continue
+
+            def h(p_llega, cad_nom=nom_v, c_est=c_est):
+                ajustes.setdefault(cad_nom, {})[c_est] = p_llega
+                _, sal = evaluar_todo()
+                i_ = sal[r.nombre]
+                d = i_["d_padre"] if lugar == "Llegada línea" else i_["d_ramal"]
+                return d - objetivo
+            lo, hi = recibo, recibo + (objetivo - actual) * 1.5 + 50
+            h_lo, h_hi = h(lo), h(hi)
+            k_exp = 0
+            while h_hi < 0 and k_exp < 20:
+                lo, h_lo, hi = hi, h_hi, hi + (hi - recibo)
+                h_hi = h(hi)
+                k_exp += 1
+            p_llega = _raiz(h, lo, hi, h_lo, h_hi, tol=1e-7) if h_lo < 0 < h_hi else hi
+            ajustes.setdefault(nom_v, {})[c_est] = p_llega
+            valvulas[r.nombre] = {"lugar": lugar, "estacion": cad_v.estaciones[c_est].nombre,
+                                  "cadena_valvula": nom_v, "indice_estacion": c_est, "factible": True,
+                                  "p_antes": p_llega, "recibo": recibo, "estrangula": p_llega - recibo, "nota": ""}
     res, salida = evaluar_todo()
     for nom, inf in salida.items():
         inf["nota"] = notas.get(nom, "")
         inf["pct_calculado"] = 100.0 * inf["fraccion"]
+        v = valvulas.get(nom)
+        ram = inf["ramal"]
+        if ram.modo == "Hidráulico":
+            inf["valvula"] = {"lugar": "Sin válvula (reparto hidráulico)", "estrangula": 0.0}
+        elif v and v.get("factible"):
+            inf["valvula"] = v
+        else:
+            ep, er = inf["estrangula_padre"] or 0.0, inf["estrangula_ramal"] or 0.0
+            padre = cadena_de(proy, ram.padre)
+            nodo_nom = padre.estaciones[ram.nodo].nombre if padre is not None else ""
+            inf["valvula"] = {"lugar": "Nodo", "estacion": nodo_nom, "factible": True,
+                              "rama": "ramal" if er >= ep else "línea", "estrangula": max(ep, er),
+                              "nota": (v or {}).get("nota", "")}
+            if (v or {}).get("nota"):
+                inf["nota"] = (inf["nota"] + " " + v["nota"]).strip()
     out = Resultados(res)
     out.red = salida
     return out
@@ -1618,6 +1715,137 @@ def flujo_en_estacion(proy: Proyecto, res, cadena, ini):
     """Caudal de operación que sale de la estación 'ini' de una línea o ramal."""
     rs = list(res) if not cadena else list(((getattr(res, "red", None) or {}).get(cadena) or {}).get("res", []))
     return rs[ini].flujo_kbd if ini < len(rs) else None
+
+
+def claves_ruta(proy: Proyecto, cadena_ramales):
+    """Identificadores (cadena, índice) de las estaciones de una ruta, en el mismo orden que proyecto_ruta.
+    El nodo de un ramal se identifica con la estación de su padre."""
+    claves = [("", i) for i in range(len(proy.estaciones))]
+    inicio = 0                                       # posición en la ruta de la estación 0 de la cadena actual
+    for r in cadena_ramales:
+        pos = inicio + r.nodo
+        claves = claves[:pos + 1] + [(r.nombre, j) for j in range(1, len(r.estaciones))]
+        inicio = pos
+    return claves
+
+
+def nombre_estacion_red(proy: Proyecto, clave):
+    cad = cadena_de(proy, clave[0])
+    nombre = cad.estaciones[clave[1]].nombre if cad is not None and clave[1] < len(cad.estaciones) else "?"
+    return nombre if not clave[0] else f"{nombre} ({clave[0]})"
+
+
+def trayectos_red(proy: Proyecto):
+    """Para elegir una curva entre dos estaciones de cualquier parte de la red.
+    Devuelve (desde: [clave], hasta: {clave_desde: [claves aguas abajo]}, rutas: [(cadena_ramales, claves)])."""
+    rutas = [(cam, claves_ruta(proy, cam)) for _, cam in rutas_red(proy)]
+    desde, hasta = [], {}
+    for cam, cl in rutas:
+        for i, c in enumerate(cl[:-1]):
+            if c not in hasta:
+                desde.append(c)
+                hasta[c] = []
+            for d in cl[i + 1:]:
+                if d not in hasta[c]:
+                    hasta[c].append(d)
+    return desde, hasta, rutas
+
+
+def curva_trayecto(proy: Proyecto, res, desde, hasta, lim_inf, lim_sup, pasos=10, dr_forzado=None,
+                   recibo_fin=None, sin_bombeo_intermedio=True):
+    """Curva del sistema entre dos estaciones de la red (pueden estar en la línea principal o en ramales):
+    se busca la ruta que las une y se calcula como curva_entre_estaciones sobre esa ruta.
+    Devuelve dict con filas, nombres, caudal y recibo de operación, y título."""
+    _, _, rutas = trayectos_red(proy)
+    for cam, cl in rutas:
+        if desde in cl and hasta in cl and cl.index(desde) < cl.index(hasta):
+            pr, rr = proyecto_ruta(proy, res, cam)
+            ini, fin = cl.index(desde), cl.index(hasta)
+            rec_op = rr[fin - 1].presion_recibo if fin - 1 < len(rr) else pr.estaciones[fin].presion_recibo
+            filas, nombres = curva_entre_estaciones(pr, "", ini, fin, lim_inf, lim_sup, pasos, dr_forzado,
+                                                    rec_op if recibo_fin is None else recibo_fin,
+                                                    sin_bombeo_intermedio)
+            return {"filas": filas, "nombres": nombres, "q_op": rr[ini].flujo_kbd if ini < len(rr) else None,
+                    "recibo_op": rec_op, "tramos": pr.tramos[ini:fin],
+                    "titulo": f"{pr.estaciones[ini].nombre} → {pr.estaciones[fin].nombre}"}
+    raise ValueError("Esas dos estaciones no están en una misma ruta (la final debe estar aguas abajo).")
+
+
+def _metricas(proy, res, inf):
+    """Aguas abajo del nodo (donde influye la válvula): roturas, descuelgues y presión interna máxima
+    de la línea que continúa y del ramal."""
+    ram = inf["ramal"]
+    red = getattr(res, "red", None) or {}
+    padre = list(res) if not ram.padre else list((red.get(ram.padre) or {}).get("res", []))
+    sigue = padre[ram.nodo:]
+    rr = list(inf["res"])
+    return {"roturas_linea": sum(x.roturas for x in sigue), "roturas_ramal": sum(x.roturas for x in rr),
+            "descuelgues_linea": sum(x.descuelgues for x in sigue), "descuelgues_ramal": sum(x.descuelgues for x in rr),
+            "pmax_linea": max((max(x.O) for x in sigue if x.O), default=None),
+            "pmax_ramal": max((max(x.O) for x in rr if x.O), default=None),
+            "pmin_linea": min((min(x.O) for x in sigue if x.O), default=None),
+            "pmin_ramal": min((min(x.O) for x in rr if x.O), default=None)}
+
+
+def barrido_reparto(proy: Proyecto, nombre, pcts=None):
+    """Para cada % del flujo hacia el ramal: presión en el nodo, qué rama hay que estrangular y cuánto
+    (válvula en el nodo), y la presión antes de la válvula si va en la llegada de esa rama.
+    Además devuelve el reparto natural (sin válvula, por hidráulica). No modifica el proyecto."""
+    ram = cadena_de(proy, nombre)
+    if ram is None or ram is proy:
+        raise ValueError(f"No existe el ramal {nombre}.")
+    orig = (ram.modo, ram.pct, ram.valvula)
+    pcts = pcts if pcts is not None else [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    filas = []
+    try:
+        ram.modo = "Hidráulico"
+        res_h = calcular_proyecto(proy)
+        natural = res_h.red[nombre]["pct_calculado"] if getattr(res_h, "red", None) else None
+        nota_nat = res_h.red[nombre].get("nota", "") if getattr(res_h, "red", None) else ""
+        ram.modo = "Porcentaje"
+        for pct in pcts:
+            ram.pct = pct
+            ram.valvula = "Nodo"
+            res_n = calcular_proyecto(proy)
+            inf_n = res_n.red[nombre]
+            ram.valvula = "Automático"
+            res_a = calcular_proyecto(proy)
+            inf_a = res_a.red[nombre]
+            va = inf_a["valvula"]
+            d_p, d_r = inf_n["d_padre"], inf_n["d_ramal"]
+            rama = "—" if d_p is None or abs((d_p or 0) - (d_r or 0)) < 0.05 else ("línea" if d_r > d_p else "ramal")
+            fila = {"pct": pct, "flujo_ramal": inf_n["flujo"], "flujo_linea": inf_n["flujo_padre_despues"],
+                    "d_padre": d_p, "d_ramal": d_r, "p_nodo": inf_n["p_nodo"], "rama_estrangula": rama,
+                    "estrangula": abs((d_p or 0) - (d_r or 0)) if d_p is not None else 0.0,
+                    "valvula_llegada": va.get("estacion") if va.get("lugar") != "Nodo" else None,
+                    "p_antes_llegada": va.get("p_antes") if va.get("lugar") != "Nodo" else None,
+                    "recibo_llegada": va.get("recibo") if va.get("lugar") != "Nodo" else None}
+            mn, ma = _metricas(proy, res_n, inf_n), _metricas(proy, res_a, inf_a)
+            fila.update({f"{k}_nodo": v for k, v in mn.items()})
+            fila.update({f"{k}_llegada": v for k, v in ma.items()})
+            filas.append(fila)
+    finally:
+        ram.modo, ram.pct, ram.valvula = orig
+    return {"filas": filas, "natural": natural, "nota_natural": nota_nat}
+
+
+def comparar_valvulas(proy: Proyecto, nombre):
+    """Calcula el sistema con la válvula de control del ramal en el nodo, en la llegada de la línea y en la
+    llegada del ramal (con el % actual). Devuelve [(lugar, resultados, info del ramal, métricas)]."""
+    ram = cadena_de(proy, nombre)
+    orig = (ram.modo, ram.valvula)
+    salida = []
+    try:
+        ram.modo = "Porcentaje"
+        for lugar in ("Nodo", "Llegada línea", "Llegada ramal"):
+            ram.valvula = lugar
+            res = calcular_proyecto(proy)
+            inf = res.red[nombre]
+            ok = lugar == "Nodo" or inf["valvula"].get("lugar") == lugar
+            salida.append((lugar, res, inf, _metricas(proy, res, inf), ok))
+    finally:
+        ram.modo, ram.valvula = orig
+    return salida
 
 # --------------------------------------------------------------------------
 # Importación desde la plantilla Excel
@@ -2333,9 +2561,11 @@ def diferencias(viejo: Proyecto, nuevo: Proyecto):
         cambios.append((f"Ramal {nom}", None, "Ramal quitado", f"{len(rv[nom].tramos)} tramos", ""))
     for nom in rn.keys() & rv.keys():
         a_, b_ = rv[nom], rn[nom]
-        for campo, et in (("modo", "Modo de reparto"), ("pct", "% del flujo"), ("nodo", "Nodo"), ("padre", "Padre")):
-            if getattr(a_, campo) != getattr(b_, campo):
-                cambios.append((f"Ramal {nom}", None, et, _fmt_hist(getattr(a_, campo)), _fmt_hist(getattr(b_, campo))))
+        for campo, et in (("modo", "Modo de reparto"), ("pct", "% del flujo"), ("nodo", "Nodo"), ("padre", "Padre"),
+                          ("valvula", "Válvula de control")):
+            if getattr(a_, campo, None) != getattr(b_, campo, None):
+                cambios.append((f"Ramal {nom}", None, et, _fmt_hist(getattr(a_, campo, "")),
+                                _fmt_hist(getattr(b_, campo, ""))))
         for eo, en in zip(a_.estaciones, b_.estaciones):
             for campo, et in [("presion_recibo", "Presión recibo"), ("paso_directo", "Bypass"), ("dr", "%DR"),
                               ("fr", "FR"), ("delta_bph", "Iny(+)/Entrega(−) bph")]:
