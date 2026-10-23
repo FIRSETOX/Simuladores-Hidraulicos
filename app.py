@@ -9,6 +9,7 @@ import html
 import io
 import math
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -24,7 +25,8 @@ REQUERIDOS_MOTOR = ("presion_minima_recibo", "tolerancia_perfil", "verificar_per
                     "rutas_red", "Ramal", "posiciones_esquema", "subred_ramal",
                     "nombres_curva", "flujo_operacion", "curva_entre_estaciones",
                     "flujo_en_estacion", "curva_trayecto", "trayectos_red", "barrido_reparto",
-                    "comparar_valvulas", "VALVULAS")
+                    "comparar_valvulas", "VALVULAS", "analizar_estacion",
+                    "curva_estacion", "leer_historicos")
 
 
 def _motor_incompleto():
@@ -130,7 +132,7 @@ def marcar():
     ss.modificado = True
 
 
-VERSION_CODIGO = "2026-10-20e"
+VERSION_CODIGO = "2026-10-22a"
 
 
 def motor_desactualizado():
@@ -964,11 +966,11 @@ def figura_fuga(f, curvas=("geod", "hid", "maop")):
     return fig
 
 
-_tabs = st.tabs(["📋 Resumen", "🔀 Red / ramales", "💧 Fugas / válvula ilícita", "📉 Perfiles MOP / transitorios",
-                 "📏 Tramos", "🔧 Actualizar espesores", "📍 Interpolación", "📈 Curva del sistema",
-                 "🧪 Productos (REF)", "🕓 Historial", "❓ Ayuda"])
-tabs = [_tabs[0]] + list(_tabs[3:])
-tab_red, tab_fuga = _tabs[1], _tabs[2]
+_tabs = st.tabs(["📋 Resumen", "🔀 Red / ramales", "💧 Fugas / válvula ilícita", "⚙️ Bombas",
+                 "📉 Perfiles MOP / transitorios", "📏 Tramos", "🔧 Actualizar espesores", "📍 Interpolación",
+                 "📈 Curva del sistema", "🧪 Productos (REF)", "🕓 Historial", "❓ Ayuda"])
+tabs = [_tabs[0]] + list(_tabs[4:])
+tab_red, tab_fuga, tab_bombas = _tabs[1], _tabs[2], _tabs[3]
 
 # ================================================================ RESUMEN
 with tabs[0]:
@@ -1162,8 +1164,8 @@ with tab_red:
             else:
                 st.info("No hay otros sistemas en la base de datos.")
         else:
-            nombres_txt = st.text_area("Estaciones del ramal en orden (una por línea, sin la estación del nodo)",
-                                       "MIRAFLORES\nPORVENIR\nMONTERREY\nAPIAY\nSAN FERNANDO",
+            nombres_txt = st.text_area("Estaciones del ramal en orden (una por línea, sin la estación del nodo)", "",
+                                       placeholder="ESTACIÓN A\nESTACIÓN B\nESTACIÓN C",
                                        key=f"nr_txt_{ss.sistema}", height=140)
         cad_n, i_n, _ = ops[k_nodo]
         kmn = km_nodo(p, cad_n, i_n)
@@ -1187,6 +1189,8 @@ with tab_red:
                 st.error("Use un nombre de ramal que no exista.")
             elif otro is None and not origen.startswith("Crear"):
                 st.error("Primero cargue la plantilla o elija el sistema.")
+            elif origen.startswith("Crear") and not [x for x in nombres_txt.splitlines() if x.strip()]:
+                st.error("Escriba al menos una estación del ramal.")
             else:
                 if otro is not None:
                     sub = m.Proyecto(estaciones=otro.estaciones[ini:], tramos=otro.tramos[ini:])
@@ -1531,6 +1535,285 @@ with tab_fuga:
             st.caption("Supuestos: estado estable (sin golpe de ariete), orificio con Cd constante, presión de recibo "
                        "de las estaciones fija, válvulas de cheque que impiden el contraflujo desde aguas abajo. Es un "
                        "estimado para priorizar; no reemplaza la simulación transitoria (SPS).")
+
+# ================================================================ BOMBAS (módulo aparte)
+with tab_bombas:
+    st.markdown("Curvas de las bombas de cada estación: punto de operación con la curva del sistema **calculada por "
+                "el simulador**, RPM necesarias para el caudal actual, ventana operativa (70–120 % BEP entre la "
+                "velocidad mínima y máxima), eficiencia, potencia y datos históricos. **Es un módulo aparte**: su "
+                "configuración se guarda por separado y no modifica el sistema ni su historial.")
+    st.caption("Unidades: caudal en BPH, cabeza en pies (ft), potencia en HP. La gravedad específica y la viscosidad "
+               "son las del producto del sistema; la corrección por viscosidad sigue ANSI/HI 9.6.7.")
+    # estaciones que pueden bombear (tienen tramo aguas abajo)
+    ops_b = [("", i) for i in range(len(p.tramos))] + [(r.nombre, j) for r in p.ramales for j in range(len(r.tramos))]
+    etiq_b = {k: m.nombre_estacion_red(p, k) for k in ops_b}
+    clave_sel = st.selectbox("Estación de bombeo", ops_b, format_func=lambda k: etiq_b[k], key=f"bb_est_{ss.sistema}")
+    clave_txt = f"{clave_sel[0]}|{clave_sel[1]}"
+    k_ss = f"bomba_{ss.sistema}_{clave_txt}"
+    if k_ss not in ss:
+        guardadas = bd().bombas_de(ss.sistema)
+        ss[k_ss] = guardadas.get(clave_txt) or m.estacion_bombeo_vacia(etiq_b[clave_sel])
+    est_b = ss[k_ss]
+    info_b = bd().info_bombas(ss.sistema, clave_txt)
+    st.caption(f"Configuración guardada: {info_b[0]} por {info_b[1]}" if info_b else "Esta estación aún no tiene "
+               "bombas guardadas.")
+
+    # ---------------- tipos de bomba
+    with st.expander(f"🔩 Tipos de bomba ({len(est_b['tipos'])})", expanded=not est_b["tipos"]):
+        st.caption("Archivos CSV como los del programa de bombas: *Caudal (BPH); Cabeza (ft)*, eficiencia (en % o "
+                   "fracción) y potencia (HP, opcional). Con o sin encabezado, separador ; o , y decimal . o ,. "
+                   "Si la eficiencia está cargada, la potencia se calcula con la SG del producto.")
+        for k_t, t in enumerate(est_b["tipos"]):
+            c1, c2, c3, c4, c5, c6, c7 = st.columns([1.6, 1, 1, 1, 0.8, 1, 0.7])
+            nuevo_nom = c1.text_input("Nombre", t["nombre"], key=f"bt_nom_{k_ss}_{k_t}")
+            rn = c2.number_input("RPM nominal", 1.0, 20000.0, float(t["rpm_nominal"]), key=f"bt_rpm_{k_ss}_{k_t}")
+            rmin = c3.number_input("RPM mínima", 0.0, 20000.0, float(t.get("rpm_min") or 0.5 * t["rpm_nominal"]),
+                                   key=f"bt_rmin_{k_ss}_{k_t}")
+            rmax = c4.number_input("RPM máxima", 0.0, 20000.0, float(t.get("rpm_max") or t["rpm_nominal"]),
+                                   key=f"bt_rmax_{k_ss}_{k_t}")
+            et = c5.number_input("Etapas", 1, 20, int(t.get("etapas", 1)), key=f"bt_et_{k_ss}_{k_t}",
+                                 help="Número de etapas (impulsores): el método HI usa la cabeza por etapa.")
+            vel = c6.selectbox("Velocidad", ["variable", "fija"], index=0 if t.get("velocidad", "variable") == "variable"
+                               else 1, key=f"bt_vel_{k_ss}_{k_t}")
+            bep_auto = m.bep_tipo({**t, "bep_q": 0})
+            bq = c7.number_input("BEP (BPH)", 0.0, 1e6, float(t.get("bep_q") or 0.0), key=f"bt_bep_{k_ss}_{k_t}",
+                                 help=f"0 = el de máxima eficiencia de la curva ({bep_auto:,.0f} BPH).")
+            t.update(nombre=nuevo_nom, rpm_nominal=rn, rpm_min=rmin, rpm_max=rmax, etapas=int(et), velocidad=vel,
+                     bep_q=bq)
+            f1, f2, f3, f4 = st.columns([1, 1, 1, 0.6])
+            for col_u, campo, tipo_c in ((f1, "cabeza", "Cabeza"), (f2, "eficiencia", "Eficiencia"),
+                                         (f3, "potencia", "Potencia")):
+                arch = col_u.file_uploader(f"{tipo_c} ({len(t.get(campo) or [])} pts)", type=["csv", "txt"],
+                                           key=f"bt_f_{campo}_{k_ss}_{k_t}")
+                if arch is not None:
+                    try:
+                        datos_c = m.leer_curva((arch.name, arch.getvalue()), tipo_c)
+                        if datos_c != t.get(campo):
+                            t[campo] = datos_c
+                            st.rerun()
+                    except Exception as ex:  # noqa: BLE001
+                        col_u.error(f"{arch.name}: {ex}")
+            if f4.button("🗑️ Quitar tipo", key=f"bt_del_{k_ss}_{k_t}"):
+                est_b["tipos"].pop(k_t)
+                est_b["grupos"] = [g for g in est_b["grupos"] if g["tipo"] != k_t]
+                for g in est_b["grupos"]:
+                    if g["tipo"] > k_t:
+                        g["tipo"] -= 1
+                st.rerun()
+            st.divider()
+        if st.button("➕ Agregar tipo de bomba", key=f"bt_add_{k_ss}"):
+            est_b["tipos"].append(m.tipo_bomba_vacio(f"Bomba {len(est_b['tipos']) + 1}"))
+            st.rerun()
+
+    # ---------------- arreglo
+    tipos_ok = [k for k, t in enumerate(est_b["tipos"]) if len(t.get("cabeza") or []) >= 2]
+    with st.expander("🔗 Arreglo de la estación (grupos en serie; cada grupo = bombas iguales en paralelo)",
+                     expanded=bool(tipos_ok) and not est_b["grupos"]):
+        if not tipos_ok:
+            st.info("Primero cargue al menos un tipo de bomba con su curva de cabeza.")
+        else:
+            nombres_t = {k: est_b["tipos"][k]["nombre"] for k in tipos_ok}
+            df_g = pd.DataFrame({"Orden (en serie)": list(range(1, len(est_b["grupos"]) + 1)),
+                                 "Tipo de bomba": [nombres_t.get(g["tipo"], "") for g in est_b["grupos"]],
+                                 "Bombas en paralelo": [int(g["cantidad"]) for g in est_b["grupos"]]})
+            ed_g = st.data_editor(df_g, key=f"bg_{k_ss}_{len(est_b['tipos'])}", num_rows="dynamic", hide_index=True,
+                                  use_container_width=True, disabled=["Orden (en serie)"],
+                                  column_config={"Tipo de bomba": st.column_config.SelectboxColumn(
+                                      options=list(nombres_t.values()), required=True),
+                                      "Bombas en paralelo": st.column_config.NumberColumn(min_value=1, max_value=20,
+                                                                                          step=1, required=True)})
+            inv = {v: k for k, v in nombres_t.items()}
+            nuevos_g = [{"tipo": inv[r_["Tipo de bomba"]], "cantidad": int(r_["Bombas en paralelo"] or 1)}
+                        for _, r_ in ed_g.iterrows() if r_["Tipo de bomba"] in inv]
+            if nuevos_g != est_b["grupos"]:
+                est_b["grupos"] = nuevos_g
+                st.rerun()
+            st.caption("Ejemplo: un grupo de 1 booster seguido de un grupo de 3 bombas principales en paralelo = "
+                       "2 filas. Varias bombas en serie del mismo tipo = una fila por bomba.")
+
+    # ---------------- succión, viscosidad, guardar
+    s1, s2, s3, s4 = st.columns([1.3, 1, 1.2, 1])
+    modo_s = s1.radio("Presión de succión", ["simulador", "manual"], horizontal=True,
+                      index=0 if est_b.get("succion_modo", "simulador") == "simulador" else 1,
+                      format_func=lambda x: "Recibo de la estación (simulador)" if x == "simulador" else "Manual",
+                      key=f"bs_modo_{k_ss}")
+    ps_man = s2.number_input("Succión manual (psig)", 0.0, 5000.0, float(est_b.get("p_succion_psig", 0.0)),
+                             disabled=modo_s == "simulador", key=f"bs_ps_{k_ss}")
+    corr_v = s3.checkbox(f"Corregir por viscosidad ({p.viscosidad:g} cSt)", value=bool(est_b.get(
+        "viscosidad_correccion", True)), key=f"bs_visc_{k_ss}")
+    est_b.update(succion_modo=modo_s, p_succion_psig=ps_man, viscosidad_correccion=corr_v)
+    if s4.button("💾 Guardar estación de bombeo", type="primary", key=f"bs_guardar_{k_ss}"):
+        bd().guardar_bombas(ss.sistema, clave_txt, est_b, ss.get("usuario") or None)
+        st.success("Configuración de bombas guardada (aparte del sistema).")
+
+    # ---------------- análisis
+    sg_b = m.gravedad_especifica(p.densidad)
+    visc_b = p.viscosidad if corr_v else 0.0
+    if est_b["grupos"]:
+        try:
+            an = m.analizar_estacion(p, res, clave_sel[0], clave_sel[1], est_b)
+        except Exception as ex:  # noqa: BLE001
+            an = None
+            st.error(f"No se pudo analizar la estación: {ex}")
+        if an:
+            req = an["requerida"]
+            st.markdown(f"**Curva del sistema (simulador):** de {etiq_b[clave_sel]} hasta {req['estacion_fin']}, "
+                        f"succión {req['p_succion']:,.1f} psig, SG {sg_b:.3f}.")
+            m1, m2, m3, m4 = st.columns(4)
+            if an.get("q_operacion"):
+                m1.metric("Caudal del simulador", f"{an['q_operacion']:,.0f} BPH",
+                          f"{an['q_operacion'] * m.BPH_A_KBD:,.2f} KBDO", delta_color="off")
+                m2.metric("Cabeza diferencial requerida", f"{an['h_req_operacion']:,.0f} ft",
+                          f"{m.pies_a_psi(an['h_req_operacion'], sg_b):,.0f} psi", delta_color="off")
+                if an.get("factor_operacion"):
+                    m3.metric("Velocidad necesaria (% nominal)", f"{100 * an['factor_operacion']:.1f} %",
+                              " / ".join(f"{x:,.0f}" for x in an["rpms_operacion"]) + " rpm", delta_color="off")
+                    pot = sum(d["p_total"] for d in an["detalle_operacion"] if np.isfinite(d["p_total"]))
+                    m4.metric("Potencia al freno", f"{pot:,.0f} HP", f"{pot * 0.7457:,.0f} kW", delta_color="off")
+                else:
+                    m3.warning(an.get("motivo_operacion", ""))
+                if an.get("aviso_velocidad"):
+                    st.warning(an["aviso_velocidad"])
+            if an.get("punto"):
+                st.caption(f"A velocidad máxima la estación operaría en {an['punto']['q']:,.0f} BPH y "
+                           f"{an['punto']['h']:,.0f} ft (intersección con la curva del sistema).")
+
+            def tabla_det(det):
+                return pd.DataFrame([{
+                    "Grupo": d["grupo"], "Bombas en paralelo": d["cantidad"], "RPM": d["rpm"],
+                    "Q por bomba (BPH)": d["q_bomba"], "Cabeza del grupo (ft)": d["h"], "Eficiencia (%)": d["eta"],
+                    "% BEP": d["pct_bep"], "Ventana 70–120 % BEP": "✅" if d["en_ventana"] else "❌",
+                    "Potencia por bomba (HP)": d["p_bomba"], "Potencia grupo (HP)": d["p_total"],
+                    "Factor B (HI)": d["B"], "Cq": d["Cq"], "Ce": d["Ce"]} for d in det])
+            if an.get("detalle_operacion"):
+                st.markdown("**Bombas al caudal del simulador (con las RPM necesarias)**")
+                st.dataframe(tabla_det(an["detalle_operacion"]).style.format(precision=2, na_rep="—"),
+                             use_container_width=True, hide_index=True)
+                avisos_v = {d["aviso_visc"] for d in an["detalle_operacion"] if d["aviso_visc"]}
+                for a_ in avisos_v:
+                    st.caption(f"Viscosidad: {a_}")
+
+            # ---------------- históricos (solo en esta sesión)
+            hist = st.file_uploader("Datos históricos de operación (CSV: Caudal BPH, Cabeza ft) — opcional",
+                                    type=["csv", "txt"], key=f"bh_{k_ss}")
+            k_h = f"hist_{k_ss}"
+            if hist is not None and ss.get(k_h, (None,))[0] != hist.name:
+                with st.spinner("Leyendo históricos…"):
+                    ss[k_h] = (hist.name, *m.leer_historicos((hist.name, hist.getvalue())))
+            hq = hh = None
+            if ss.get(k_h):
+                _, hq, hh, n_tot, n_par = ss[k_h]
+                hc1, hc2 = st.columns([2, 1])
+                restar = hc2.checkbox("Los históricos son cabeza de descarga (restar la succión)",
+                                      value=bool(est_b.get("historicos_restar_succion")), key=f"bh_rs_{k_ss}")
+                est_b["historicos_restar_succion"] = restar
+                if restar:
+                    hh = hh - m.psi_a_pies(req["p_succion"], sg_b)
+                hc1.caption(f"{ss[k_h][0]}: {n_tot:,} registros; {n_par:,} con la bomba parada (caudal < 1 BPH) se "
+                            f"excluyen; se grafican {len(hq):,} como densidad.")
+
+            # ---------------- gráfico
+            fmin, fmax = m.limites_velocidad(est_b)
+            figb = go.Figure()
+            if hq is not None and len(hq):
+                xr = np.percentile(hq, [0.5, 99.5])
+                yr = np.percentile(hh, [0.5, 99.5])
+                H2, xe, ye = np.histogram2d(hq, hh, bins=[120, 120], range=[xr, yr])
+                Z = np.log10(H2.T, where=H2.T > 0, out=np.full(H2.T.shape, np.nan))
+                figb.add_trace(go.Heatmap(x=(xe[:-1] + xe[1:]) / 2, y=(ye[:-1] + ye[1:]) / 2, z=Z,
+                                          colorscale="Purples", showscale=False, name="Históricos (densidad)",
+                                          hovertemplate="Q %{x:,.0f} BPH<br>H %{y:,.0f} ft<br>log10(n) %{z:.1f}"
+                                                        "<extra>Históricos</extra>", zmin=0))
+            ven = m.ventana_operativa(est_b, visc_b, sg_b)
+            if ven:
+                figb.add_trace(go.Scatter(x=[x for x, _ in ven["poligono"]], y=[y for _, y in ven["poligono"]],
+                                          fill="toself", fillcolor="rgba(46,117,182,0.15)", mode="lines",
+                                          line=dict(color="rgba(46,117,182,0.5)", width=1),
+                                          name="Ventana operativa (70–120 % BEP)", hoverinfo="skip"))
+            elif est_b["grupos"]:
+                st.caption("⚠ Sin ventana común: los grupos en serie no comparten el rango 70–120 % BEP.")
+            for f_, nom_, est_l in ((fmax, "máx.", "solid"), (1.0, "nominal", "dot"), (fmin, "mín.", "dash")):
+                if nom_ == "nominal" and (abs(fmax - 1) < 1e-9 or abs(fmin - 1) < 1e-9):
+                    continue
+                qv, hv, _ = m.curva_estacion(est_b, m.velocidades(est_b, f_), visc_b, sg_b)
+                figb.add_trace(go.Scatter(x=qv, y=hv, mode="lines", name=f"Estación a velocidad {nom_} ({100 * f_:.0f} %)",
+                                          line=dict(color=AZUL, dash=est_l, width=2.5 if est_l == "solid" else 1.5)))
+            figb.add_trace(go.Scatter(x=req["q"], y=req["h_dif"], mode="lines", name="Sistema (simulador), cabeza diferencial",
+                                      line=dict(color="#C00000", width=2.5)))
+            ps_ext = st.number_input("Succión para las curvas del sistema externas (psig)", 0.0, 5000.0,
+                                     float(est_b.get("succion_ext_psig", 0.0)), key=f"bs_psext_{k_ss}") \
+                if est_b.get("curvas_sistema_ext") else 0.0
+            est_b["succion_ext_psig"] = ps_ext
+            for k_c, (nom_c, pts_c) in enumerate((est_b.get("curvas_sistema_ext") or {}).items()):
+                if nom_c not in est_b.get("curvas_ext_visibles", []):
+                    continue
+                arr = np.array(pts_c)
+                figb.add_trace(go.Scatter(x=arr[:, 0], y=arr[:, 1] - m.psi_a_pies(ps_ext, sg_b), mode="lines",
+                                          name=f"Sistema externo: {nom_c[:45]}",
+                                          line=dict(width=1.2, color=COLORES_PERFILES[k_c % len(COLORES_PERFILES)])))
+            if an.get("q_operacion") and an.get("factor_operacion"):
+                figb.add_trace(go.Scatter(x=[an["q_operacion"]], y=[an["h_req_operacion"]], mode="markers+text",
+                                          marker=dict(symbol="star", size=16, color="gold", line=dict(color="black", width=1)),
+                                          text=[f"  {100 * an['factor_operacion']:.1f} % rpm"], textposition="middle right",
+                                          name="Operación actual (simulador)"))
+            if an.get("punto"):
+                figb.add_trace(go.Scatter(x=[an["punto"]["q"]], y=[an["punto"]["h"]], mode="markers",
+                                          marker=dict(symbol="circle", size=11, color="#C00000"),
+                                          name="Punto a velocidad máxima"))
+            # eje vertical centrado en la zona útil (la curva del sistema puede crecer mucho a caudales altos)
+            cand_y = [np.nanmax(m.curva_estacion(est_b, m.velocidades(est_b, fmax), visc_b, sg_b)[1]) * 1.3]
+            if an.get("h_req_operacion"):
+                cand_y.append(an["h_req_operacion"] * 1.3)
+            if hq is not None and len(hq):
+                cand_y.append(float(np.percentile(hh, 99.5)) * 1.08)
+            y_max = max(max(cand_y), 1.0)
+            figb.update_layout(template="plotly_white", height=560, xaxis_title="Caudal de la estación (BPH)",
+                               yaxis_title="Cabeza diferencial (ft)", legend=dict(orientation="h", y=-0.18),
+                               yaxis=dict(range=[0, y_max]), margin=dict(t=40, b=10),
+                               title=f"Bombas – {etiq_b[clave_sel]}")
+            st.plotly_chart(figb, use_container_width=True, config={"displaylogo": False})
+            if hq is not None and len(hq) and ven:
+                dentro = m.dentro_poligono(hq, hh, ven["poligono"])
+                st.info(f"Históricos: el **{100 * dentro.mean():.1f} %** del tiempo operando estuvo dentro de la ventana "
+                        f"operativa. Caudal P5–P50–P95: {' – '.join(f'{x:,.0f}' for x in np.percentile(hq, [5, 50, 95]))} "
+                        f"BPH; cabeza P5–P50–P95: {' – '.join(f'{x:,.0f}' for x in np.percentile(hh, [5, 50, 95]))} ft.")
+
+            # eficiencia y potencia por grupo a velocidad nominal
+            fe = go.Figure()
+            _, _, grupos_n = m.curva_estacion(est_b, m.velocidades(est_b, 1.0), visc_b, sg_b)
+            for g_, cfg_ in zip(grupos_n, est_b["grupos"]):
+                nom_g = f"{est_b['tipos'][cfg_['tipo']]['nombre']} ×{cfg_['cantidad']}"
+                fe.add_trace(go.Scatter(x=g_["q"], y=g_["eta"], name=f"Eficiencia {nom_g} (%)", mode="lines"))
+                fe.add_trace(go.Scatter(x=g_["q"], y=g_["p"], name=f"Potencia {nom_g} (HP)", mode="lines",
+                                        yaxis="y2", line=dict(dash="dot")))
+            fe.update_layout(template="plotly_white", height=330, xaxis_title="Caudal (BPH)",
+                             yaxis=dict(title="Eficiencia (%)"), legend=dict(orientation="h", y=-0.3),
+                             yaxis2=dict(title="Potencia (HP)", overlaying="y", side="right"), margin=dict(t=30),
+                             title="Eficiencia y potencia por grupo (velocidad nominal)")
+            st.plotly_chart(fe, use_container_width=True, config={"displaylogo": False})
+    else:
+        st.info("Configure los tipos de bomba y el arreglo de la estación para ver el análisis.")
+
+    with st.expander("📈 Curvas del sistema externas (opcional, p.ej. de SPS o del programa de bombas)"):
+        st.caption("CSV o Excel: primera columna caudal (BPH), demás columnas cabeza de descarga requerida (ft) con el "
+                   "nombre de cada curva en el encabezado. Se grafican restando la succión indicada.")
+        arch_s = st.file_uploader("Curvas del sistema", type=["csv", "txt", "xlsx"], key=f"bcs_{k_ss}")
+        if arch_s is not None:
+            try:
+                cur = m.leer_curvas_sistema((arch_s.name, arch_s.getvalue()))
+                if cur != est_b.get("curvas_sistema_ext"):
+                    est_b["curvas_sistema_ext"] = cur
+                    est_b["curvas_ext_visibles"] = list(cur)[:3]
+                    st.rerun()
+            except Exception as ex:  # noqa: BLE001
+                st.error(str(ex))
+        if est_b.get("curvas_sistema_ext"):
+            vis = st.multiselect("Curvas a mostrar", list(est_b["curvas_sistema_ext"]),
+                                 default=[x for x in est_b.get("curvas_ext_visibles", []) if x in est_b["curvas_sistema_ext"]],
+                                 key=f"bcs_vis_{k_ss}")
+            if vis != est_b.get("curvas_ext_visibles"):
+                est_b["curvas_ext_visibles"] = vis
+                st.rerun()
 
 # ================================================================ PERFILES MOP / TRANSITORIOS
 with tabs[1]:
@@ -1951,6 +2234,10 @@ with tabs[8]:
 4d. **💧 Fugas / válvula ilícita**: caudal que sale por una válvula ilícita o un derrame en un km (ecuación de orificio
    con la presión de la línea, recalculando la línea con la fuga), volumen perdido y cómo cambian las presiones y
    caudales en las estaciones (con caudal constante o con presión de descarga constante).
+4e. **⚙️ Bombas** (módulo aparte, se guarda por separado): cargue los tipos de bomba de cada estación (curvas de
+   cabeza, eficiencia y potencia en CSV), el arreglo (grupos en serie, bombas iguales en paralelo) y vea el punto de
+   operación con la curva del sistema del simulador, las RPM necesarias para el caudal actual, la ventana operativa
+   70–120 % BEP, la potencia con la SG del producto, la corrección por viscosidad (HI) y los datos históricos.
 5. **Tramos**: perfil completo de cada tramo. Las columnas ✏️ se pueden editar o pegar desde Excel.
 6. **Actualizar espesores**: por rango de km o con un archivo de rangos de una inspección.
 7. **💾 Guardar**: guarda en la base de datos compartida y registra los cambios en el **Historial**. Si otro

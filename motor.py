@@ -26,6 +26,7 @@ from datetime import datetime
 
 
 
+
 # --------------------------------------------------------------------------
 # Constantes (las mismas que usa la hoja de cálculo)
 # --------------------------------------------------------------------------
@@ -1382,14 +1383,31 @@ def _evaluar(proy, cadena, nombre, q0, fracs, salida, es_ramal, ajustes=None):
 def calcular_red(proy: Proyecto, flujo_kbd=None, iteraciones=40):
     """Calcula la línea principal y todos sus ramales.
 
-    Ramales en modo Porcentaje: fracción fija. Ramales en modo Hidráulico: se busca la fracción con la
-    que la presión que pide el ramal en el nodo es igual a la que pide la línea que continúa
-    (mismo nodo, sin válvula de control); se resuelve por bisección (barridos sucesivos si hay varios)."""
+    Ramales en modo Porcentaje: fracción fija; la válvula de control puede estar en el nodo o en la llegada
+    de una de las ramas. Ramales en modo Hidráulico (sin válvula): se busca la fracción con la que la
+    presión que pide el ramal en el nodo es igual a la que piden las demás ramas del mismo nodo (la línea
+    que continúa y los otros ramales). Si hay varios ramales acoplados se resuelven por barridos sucesivos."""
     q0 = proy.flujo_kbd if flujo_kbd is None else flujo_kbd
     nombres = {r.nombre for r in proy.ramales}
     fracs = {r.nombre: min(max(r.pct / 100.0, 0.0), 1.0) for r in proy.ramales}
     hidraulicos = [r for r in proy.ramales if r.modo == "Hidráulico"]
     notas = {}
+    # en un mismo nodo los % fijos no pueden sumar más de 100 %
+    grupos = {}
+    for r in proy.ramales:
+        grupos.setdefault((r.padre or "", r.nodo), []).append(r)
+    for (_, _), rs in grupos.items():
+        fijos = [r for r in rs if r.modo != "Hidráulico"]
+        tot = sum(fracs[r.nombre] for r in fijos)
+        if tot > 1 + 1e-12:
+            for r in fijos:
+                fracs[r.nombre] /= tot
+                notas[r.nombre] = (f"Los % de los ramales de este nodo suman {100 * tot:g} %: se ajustaron "
+                                   f"proporcionalmente a 100 %.")
+
+    def disponible_para(h):
+        """Fracción máxima que puede llevarse h: lo que dejan los demás ramales del mismo nodo."""
+        return max(0.0, 1.0 - sum(fracs[r.nombre] for r in grupos[(h.padre or "", h.nodo)] if r is not h))
 
     ajustes = {}                                     # {cadena: {estación: presión antes de la válvula}}
 
@@ -1398,90 +1416,125 @@ def calcular_red(proy: Proyecto, flujo_kbd=None, iteraciones=40):
         res = _evaluar(proy, proy, "", q0, fracs, salida, False, ajustes)
         return res, salida
 
-    for _ in range(4 if len(hidraulicos) > 1 else 1):
-        for h in hidraulicos:
-            if h.padre and h.padre not in nombres:
-                continue
-
-            def g(fr):
-                fracs[h.nombre] = fr
-                res, sal = evaluar_todo()
-                inf = sal.get(h.nombre)
-                if not inf or inf["d_padre"] is None or inf["d_ramal"] is None:
-                    return None
-                return inf["d_padre"] - inf["d_ramal"]
-            g0, g1 = g(0.0), g(1.0)
-            if g0 is None:
-                fracs[h.nombre] = min(max(h.pct / 100.0, 0.0), 1.0)
-                notas[h.nombre] = ("El reparto hidráulico necesita que la línea continúe después del nodo; "
-                                   "se usó el porcentaje.")
-                continue
-            if g0 <= 0:
-                fracs[h.nombre] = 0.0
-                notas[h.nombre] = "Con estas presiones de recibo el ramal no recibe flujo (la línea pide más presión)."
-                continue
-            if g1 >= 0:
-                fracs[h.nombre] = 1.0
-                notas[h.nombre] = "Con estas presiones de recibo todo el flujo se va por el ramal."
-                continue
-            fracs[h.nombre] = _raiz(g, 0.0, 1.0, g0, g1, tol=1e-9, maxit=iteraciones)
-            notas.pop(h.nombre, None)
-
-    # válvula de control en la llegada (modo Porcentaje): la presión con la que llega esa rama a su
-    # estación de control se sube hasta que pida en el nodo lo mismo que la otra rama (sin estrangular
-    # en el nodo); la válvula reduce de esa presión a la presión de recibo de la estación.
     valvulas = {}
     con_valvula = [r for r in proy.ramales if r.modo != "Hidráulico" and (r.valvula or "Nodo") != "Nodo"
                    and (not r.padre or r.padre in nombres)]
-    for _ in range(3 if len(con_valvula) > 1 else 1):
-        for r in con_valvula:
-            padre = cadena_de(proy, r.padre)
-            for cad_nom in (r.padre or "", r.nombre):
-                ajustes.get(cad_nom, {}).pop(estacion_control(padre if cad_nom == (r.padre or "") else r,
-                                                              r.nodo if cad_nom == (r.padre or "") else 0), None)
-            res0, sal0 = evaluar_todo()
-            inf = sal0.get(r.nombre)
-            if not inf or inf["d_ramal"] is None:
-                continue
-            d_p, d_r = inf["d_padre"], inf["d_ramal"]
-            lugar = r.valvula
-            if lugar == "Automático":
-                lugar = "Llegada línea" if (d_p is not None and d_r >= d_p) else "Llegada ramal"
-            if lugar == "Llegada línea" and d_p is None:
-                valvulas[r.nombre] = {"nota": "La línea no continúa después del nodo: la válvula queda en el nodo."}
-                continue
-            if lugar == "Llegada línea":
-                cad_v, nom_v, k0, objetivo, actual = padre, r.padre or "", r.nodo, d_r, d_p
-            else:
-                cad_v, nom_v, k0, objetivo, actual = r, r.nombre, 0, d_p, d_r
-            c_est = estacion_control(cad_v, k0)
-            recibo = cad_v.estaciones[c_est].presion_recibo
-            if objetivo is None or objetivo <= actual + 1e-9:
-                otra = "del ramal" if lugar == "Llegada línea" else "de la línea"
-                valvulas[r.nombre] = {"lugar": lugar, "estacion": cad_v.estaciones[c_est].nombre, "factible": False,
-                                      "nota": (f"Con la válvula en {cad_v.estaciones[c_est].nombre} no se logra el "
-                                               f"{r.pct:g} %: esa rama ya pide más presión en el nodo que la otra. La "
-                                               f"válvula debe ir en el nodo o en la llegada {otra}.")}
-                continue
 
-            def h(p_llega, cad_nom=nom_v, c_est=c_est):
-                ajustes.setdefault(cad_nom, {})[c_est] = p_llega
-                _, sal = evaluar_todo()
-                i_ = sal[r.nombre]
-                d = i_["d_padre"] if lugar == "Llegada línea" else i_["d_ramal"]
-                return d - objetivo
-            lo, hi = recibo, recibo + (objetivo - actual) * 1.5 + 50
-            h_lo, h_hi = h(lo), h(hi)
-            k_exp = 0
-            while h_hi < 0 and k_exp < 20:
-                lo, h_lo, hi = hi, h_hi, hi + (hi - recibo)
-                h_hi = h(hi)
-                k_exp += 1
-            p_llega = _raiz(h, lo, hi, h_lo, h_hi, tol=1e-7) if h_lo < 0 < h_hi else hi
+    def otros_en_nodo(sal, r):
+        """Presión que piden en el nodo de r las demás ramas: la línea que continúa y los otros ramales que
+        salen del mismo nodo. Devuelve (presión de la línea que continúa, máxima de las otras ramas)."""
+        inf = sal.get(r.nombre)
+        if not inf:
+            return None, None
+        hermanos = [i2["d_ramal"] for n2, i2 in sal.items()
+                    if n2 != r.nombre and (i2["ramal"].padre or "") == (r.padre or "") and i2["ramal"].nodo == r.nodo
+                    and i2["d_ramal"] is not None and i2["fraccion"] > 0]
+        vals = [x for x in [inf["d_padre"]] + hermanos if x is not None]
+        return inf["d_padre"], (max(vals) if vals else None)
+
+    def paso_hidraulico(h):
+        if h.padre and h.padre not in nombres:
+            return
+
+        def g(fr):
+            fracs[h.nombre] = fr
+            _, sal = evaluar_todo()
+            inf = sal.get(h.nombre)
+            _, otros = otros_en_nodo(sal, h)
+            if not inf or otros is None or inf["d_ramal"] is None:
+                return None
+            return otros - inf["d_ramal"]
+        f_max = disponible_para(h)
+        g0, g1 = g(0.0), g(f_max)
+        if g0 is None:
+            fracs[h.nombre] = min(max(h.pct / 100.0, 0.0), f_max)
+            notas[h.nombre] = ("El reparto hidráulico necesita otra rama en el nodo (la línea que continúa u otro "
+                               "ramal); se usó el porcentaje.")
+            return
+        if g0 <= 0:
+            fracs[h.nombre] = 0.0
+            notas[h.nombre] = "Con estas presiones de recibo el ramal no recibe flujo (las otras ramas piden más presión)."
+            return
+        if g1 >= 0:
+            fracs[h.nombre] = f_max
+            notas[h.nombre] = ("Con estas presiones de recibo todo el flujo se va por el ramal." if f_max >= 1 - 1e-12
+                               else "Con estas presiones de recibo el ramal se lleva todo el flujo que dejan los demás.")
+            return
+        fracs[h.nombre] = _raiz(g, 0.0, f_max, g0, g1, tol=1e-9, maxit=iteraciones)
+        notas.pop(h.nombre, None)
+
+    def paso_valvula(r):
+        """Válvula en la llegada (modo Porcentaje): la presión con la que llega esa rama a su estación de
+        control se sube hasta que pida en el nodo lo mismo que las demás ramas (sin estrangular en el nodo);
+        la válvula baja de esa presión a la presión de recibo de la estación."""
+        padre = cadena_de(proy, r.padre)
+        c_linea, c_ramal = estacion_control(padre, r.nodo), estacion_control(r, 0)
+        ajustes.get(r.nombre, {}).pop(c_ramal, None)
+        if valvulas.get(r.nombre, {}).get("lugar") == "Llegada línea":
+            ajustes.get(r.padre or "", {}).pop(c_linea, None)
+        _, sal0 = evaluar_todo()
+        inf = sal0.get(r.nombre)
+        if not inf or inf["d_ramal"] is None:
+            return
+        d_p, otros = otros_en_nodo(sal0, r)
+        d_r = inf["d_ramal"]
+        hermanos_max = None
+        if otros is not None and d_p is not None and otros > d_p + 1e-9:
+            hermanos_max = otros
+        lugar = r.valvula
+        if lugar == "Automático":
+            lugar = "Llegada línea" if (d_p is not None and d_r >= (otros or d_r) - 1e-9) else "Llegada ramal"
+        if lugar == "Llegada línea" and d_p is None:
+            valvulas[r.nombre] = {"nota": "La línea no continúa después del nodo: la válvula queda en el nodo."}
+            return
+        if lugar == "Llegada línea":
+            cad_v, nom_v, c_est = padre, r.padre or "", c_linea
+            objetivo, actual = max(d_r, hermanos_max or d_r), d_p
+        else:
+            cad_v, nom_v, c_est = r, r.nombre, c_ramal
+            objetivo, actual = otros, d_r
+        recibo = cad_v.estaciones[c_est].presion_recibo
+        if objetivo is None or objetivo <= actual + 1e-9:
+            otra = "del ramal" if lugar == "Llegada línea" else "de la línea"
+            valvulas[r.nombre] = {"lugar": lugar, "estacion": cad_v.estaciones[c_est].nombre, "factible": False,
+                                  "nota": (f"Con la válvula en {cad_v.estaciones[c_est].nombre} no se logra el "
+                                           f"{r.pct:g} %: esa rama ya pide más presión en el nodo que las otras. La "
+                                           f"válvula debe ir en el nodo o en la llegada {otra}.")}
+            return
+
+        def h(p_llega):
             ajustes.setdefault(nom_v, {})[c_est] = p_llega
-            valvulas[r.nombre] = {"lugar": lugar, "estacion": cad_v.estaciones[c_est].nombre,
-                                  "cadena_valvula": nom_v, "indice_estacion": c_est, "factible": True,
-                                  "p_antes": p_llega, "recibo": recibo, "estrangula": p_llega - recibo, "nota": ""}
+            _, sal = evaluar_todo()
+            i_ = sal[r.nombre]
+            d = i_["d_padre"] if lugar == "Llegada línea" else i_["d_ramal"]
+            return d - objetivo
+        lo, hi = recibo, recibo + (objetivo - actual) * 1.5 + 50
+        h_lo, h_hi = h(lo), h(hi)
+        k_exp = 0
+        while h_hi < 0 and k_exp < 20:
+            lo, h_lo, hi = hi, h_hi, hi + (hi - recibo)
+            h_hi = h(hi)
+            k_exp += 1
+        p_llega = _raiz(h, lo, hi, h_lo, h_hi, tol=1e-7) if h_lo < 0 < h_hi else hi
+        ajustes.setdefault(nom_v, {})[c_est] = p_llega
+        valvulas[r.nombre] = {"lugar": lugar, "estacion": cad_v.estaciones[c_est].nombre, "cadena_valvula": nom_v,
+                              "indice_estacion": c_est, "factible": True, "p_antes": p_llega, "recibo": recibo,
+                              "estrangula": p_llega - recibo, "nota": ""}
+
+    # reparto hidráulico y válvulas en la llegada se resuelven juntos (barridos sucesivos hasta converger)
+    acoplado = len(hidraulicos) + len(con_valvula) > 1
+    for barrido in range(8 if acoplado else 1):
+        antes = (dict(fracs), {k: dict(v) for k, v in ajustes.items()})
+        for h in hidraulicos:
+            paso_hidraulico(h)
+        for r in con_valvula:
+            paso_valvula(r)
+        if barrido > 0:
+            cambio_f = max((abs(fracs[k] - antes[0].get(k, 0)) for k in fracs), default=0)
+            cambio_a = max((abs(v - antes[1].get(k1, {}).get(k2, v)) for k1, d in ajustes.items()
+                            for k2, v in d.items()), default=0)
+            if cambio_f < 1e-8 and cambio_a < 1e-5:
+                break
     res, salida = evaluar_todo()
     for nom, inf in salida.items():
         inf["nota"] = notas.get(nom, "")
@@ -1490,6 +1543,9 @@ def calcular_red(proy: Proyecto, flujo_kbd=None, iteraciones=40):
         ram = inf["ramal"]
         if ram.modo == "Hidráulico":
             inf["valvula"] = {"lugar": "Sin válvula (reparto hidráulico)", "estrangula": 0.0}
+            sobra = (inf["p_nodo"] or 0) - (inf["d_ramal"] or 0)
+            if inf["nota"] and sobra > 0.05:
+                inf["nota"] += f" En el nodo le sobran {sobra:,.1f} psi (llegará con más presión que su recibo)."
         elif v and v.get("factible"):
             inf["valvula"] = v
         else:
@@ -1845,6 +1901,497 @@ def comparar_valvulas(proy: Proyecto, nombre):
             salida.append((lugar, res, inf, _metricas(proy, res, inf), ok))
     finally:
         ram.modo, ram.valvula = orig
+    return salida
+
+
+# ==========================================================================
+# ESTACIONES DE BOMBEO (módulo aparte): curvas de bombas, punto de operación con la curva del sistema
+# del simulador, RPM necesarias, ventana operativa, potencia y datos históricos.
+# Unidades del módulo: caudal en BPH, cabeza en pies, potencia en HP, eficiencia en %.
+# ==========================================================================
+import numpy as np
+
+PSI_A_FT = 2.31                  # ft de agua por psi (se divide por la gravedad específica)
+BPH_A_GPM = 0.7                  # 1 bph = 42 gal / 60 min
+VENTANA_BEP = (0.70, 1.20)       # región de operación preferida (fracción del caudal BEP)
+
+
+def gravedad_especifica(densidad_kgm3):
+    return (densidad_kgm3 or 1000.0) / 1000.0
+
+
+def psi_a_pies(psi, sg):
+    return psi * PSI_A_FT / sg
+
+
+def pies_a_psi(ft, sg):
+    return ft * sg / PSI_A_FT
+
+
+# -------------------------------------------------------------------------- lectura de archivos
+def _texto_de(origen):
+    """origen: ruta, o (nombre, bytes) de un archivo subido. Devuelve (nombre, texto)."""
+    if isinstance(origen, tuple):
+        nombre, contenido = origen
+    else:
+        nombre = origen
+        with open(origen, "rb") as fh:
+            contenido = fh.read()
+    for cod in ("utf-8-sig", "latin-1"):
+        try:
+            return nombre, contenido.decode(cod)
+        except UnicodeDecodeError:
+            continue
+    return nombre, contenido.decode("utf-8", errors="replace")
+
+
+def _filas_numericas(texto, max_columnas=None):
+    """Detecta separador (; , tab) y decimal (. o ,) a partir de las líneas de datos.
+    Devuelve (encabezado o None, lista de filas de floats; NaN donde la celda está vacía)."""
+    lineas = [ln.strip() for ln in texto.splitlines() if ln.strip().strip(";,\t ")]
+    if not lineas:
+        return None, []
+    muestra = lineas[1:40] if len(lineas) > 1 else lineas
+    cuenta = {s: sum(ln.count(s) for ln in muestra) for s in (";", "\t", ",")}
+    if cuenta[";"] > 0:
+        sep = ";"
+    elif cuenta["\t"] > 0:
+        sep = "\t"
+    else:
+        sep = ","
+    decimal_coma = sep != "," and any("," in ln for ln in muestra)
+
+    def num(v):
+        v = v.strip().strip('"')
+        if not v:
+            return float("nan")
+        if decimal_coma:
+            v = v.replace(".", "").replace(",", ".") if v.count(",") == 1 and v.count(".") >= 1 else v.replace(",", ".")
+        return float(v)
+    encabezado, filas = None, []
+    for k, ln in enumerate(lineas):
+        partes = ln.split(sep)
+        if max_columnas:
+            partes = partes[:max_columnas]
+        try:
+            fila = [num(x) for x in partes]
+        except ValueError:
+            if k == 0 and encabezado is None:
+                encabezado = [x.strip().strip('"') for x in partes]
+            continue
+        if any(not math.isnan(x) for x in fila):
+            filas.append(fila)
+    return encabezado, filas
+
+
+def leer_curva(origen, tipo="Cabeza"):
+    """Curva de bomba de un CSV (Caudal BPH; Cabeza ft | Eficiencia | Potencia HP), con o sin
+    encabezado, separador ; o , y decimal . o ,. La eficiencia en fracción (0-1) se pasa a %.
+    Devuelve [[q, y], ...] ordenado por caudal."""
+    _, texto = _texto_de(origen)
+    _, filas = _filas_numericas(texto, 2)
+    pts = sorted((f[0], f[1]) for f in filas if len(f) >= 2 and not math.isnan(f[0]) and not math.isnan(f[1]))
+    if len(pts) < 2:
+        raise ValueError("La curva necesita al menos 2 puntos (caudal, valor).")
+    if tipo == "Eficiencia" and max(y for _, y in pts) <= 1.5:
+        pts = [(q, 100 * y) for q, y in pts]
+    if tipo == "Eficiencia":
+        pts = [(q, min(max(y, 0.0), 100.0)) for q, y in pts]
+    salida, vistos = [], set()
+    for q, y in pts:
+        if q not in vistos:
+            vistos.add(q)
+            salida.append([max(q, 0.0), y])
+    return salida
+
+
+def leer_curvas_sistema(origen):
+    """Curvas del sistema externas: primera columna caudal (BPH), demás columnas cabeza (ft) con el nombre
+    de cada curva en el encabezado. CSV o Excel. Devuelve {nombre: [[q, h], ...]}."""
+    nombre, _ = (origen if isinstance(origen, tuple) else (origen, None))
+    if str(nombre).lower().endswith((".xlsx", ".xlsm", ".xls")):
+        import openpyxl
+        contenido = origen[1] if isinstance(origen, tuple) else open(origen, "rb").read()
+        ws = openpyxl.load_workbook(io.BytesIO(contenido), data_only=True, read_only=True).worksheets[0]
+        filas_x = [list(r) for r in ws.iter_rows(values_only=True)]
+        enc = [str(x) if x is not None else "" for x in filas_x[0]]
+        filas = []
+        for r in filas_x[1:]:
+            try:
+                filas.append([float(x) if x not in (None, "") else float("nan") for x in r])
+            except (TypeError, ValueError):
+                continue
+    else:
+        _, texto = _texto_de(origen)
+        enc, filas = _filas_numericas(texto)
+    if not filas:
+        raise ValueError("El archivo no tiene datos numéricos.")
+    ncol = max(len(f) for f in filas)
+    enc = (enc or []) + [""] * ncol
+    curvas = {}
+    for j in range(1, ncol):
+        pts = sorted((f[0], f[j]) for f in filas if len(f) > j and not math.isnan(f[0]) and not math.isnan(f[j]))
+        if len(pts) >= 2:
+            nom = (enc[j] or f"Curva {j}").strip()
+            base, k = nom, 2
+            while nom in curvas:
+                nom, k = f"{base} ({k})", k + 1
+            curvas[nom] = [[q, h] for q, h in pts]
+    if not curvas:
+        raise ValueError("No se encontraron curvas con al menos 2 puntos.")
+    return curvas
+
+
+def leer_historicos(origen, caudal_minimo=1.0):
+    """Datos históricos de operación (Caudal BPH, Cabeza ft). Descarta bomba parada (caudal < mínimo).
+    NO elimina caudales repetidos (se conserva la distribución real). Devuelve (q, h, n_total, n_parados)."""
+    nombre, texto = _texto_de(origen)
+    try:
+        import pandas as pd
+        from io import StringIO
+        prim = texto[:2000]
+        sep = ";" if prim.count(";") > 0 else ("\t" if prim.count("\t") > 0 else ",")
+        dec = "," if sep != "," and "," in prim.splitlines()[min(1, len(prim.splitlines()) - 1)] else "."
+        df = pd.read_csv(StringIO(texto), sep=sep, decimal=dec, header=None, usecols=[0, 1],
+                         dtype=str, engine="c", on_bad_lines="skip")
+        q = pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy(dtype=float)
+        h = pd.to_numeric(df.iloc[:, 1], errors="coerce").to_numpy(dtype=float)
+    except ImportError:
+        _, filas = _filas_numericas(texto, 2)
+        q = np.array([f[0] for f in filas if len(f) >= 2], dtype=float)
+        h = np.array([f[1] for f in filas if len(f) >= 2], dtype=float)
+    ok = np.isfinite(q) & np.isfinite(h)
+    q, h = q[ok], h[ok]
+    n_total = int(len(q))
+    oper = q >= caudal_minimo
+    return q[oper], h[oper], n_total, int(n_total - oper.sum())
+
+
+# -------------------------------------------------------------------------- modelo de datos (dict JSON)
+def tipo_bomba_vacio(nombre="Bomba"):
+    return {"nombre": nombre, "cabeza": [], "eficiencia": [], "potencia": [], "rpm_nominal": 3560.0,
+            "rpm_min": 0.0, "rpm_max": 0.0, "bep_q": 0.0, "etapas": 1, "velocidad": "variable"}
+
+
+def estacion_bombeo_vacia(nombre_estacion=""):
+    """Configuración de una estación de bombeo. 'grupos' van en serie (en el orden de la lista);
+    cada grupo tiene 'cantidad' bombas iguales de un tipo en paralelo y su velocidad de operación."""
+    return {"estacion": nombre_estacion, "tipos": [], "grupos": [],
+            "succion_modo": "simulador", "p_succion_psig": 0.0, "viscosidad_correccion": True,
+            "curvas_sistema_ext": {}, "succion_ext_psig": 0.0, "historicos_restar_succion": False}
+
+
+def bep_tipo(tipo):
+    """Caudal BEP del tipo (dato o el de máxima eficiencia de la curva)."""
+    if tipo.get("bep_q"):
+        return float(tipo["bep_q"])
+    ef = tipo.get("eficiencia") or []
+    if ef:
+        return float(max(ef, key=lambda p: p[1])[0])
+    cab = tipo.get("cabeza") or []
+    return float(cab[-1][0]) * 0.75 if cab else 0.0
+
+
+def _interp(x, xs, ys):
+    return np.interp(x, xs, ys, left=np.nan, right=np.nan)
+
+
+# -------------------------------------------------------------------------- corrección por viscosidad
+def factores_viscosidad(viscosidad_cst, h_bep_ft, q_bep_bph, rpm, etapas=1):
+    """ANSI/HI 9.6.7: factor B y correcciones Cq, Ce (Ch depende del caudal). Para B <= 1 no hay
+    corrección; para B > 40 el método está fuera de rango (se calcula y se avisa)."""
+    if viscosidad_cst <= 0 or h_bep_ft <= 0 or q_bep_bph <= 0 or rpm <= 0:
+        return {"B": None, "Cq": 1.0, "Ce": 1.0, "aplica": False, "aviso": ""}
+    h_etapa = h_bep_ft / max(int(etapas or 1), 1)
+    q_gpm = q_bep_bph * BPH_A_GPM
+    B = 26.6 * viscosidad_cst ** 0.5 * h_etapa ** 0.0625 / (q_gpm ** 0.375 * rpm ** 0.25)
+    if B <= 1.0:
+        return {"B": B, "Cq": 1.0, "Ce": 1.0, "aplica": False, "aviso": "B ≤ 1: no requiere corrección."}
+    cq = math.exp(-0.165 * math.log10(B) ** 3.15)
+    ce = B ** (-0.0547 * B ** 0.69)
+    aviso = "B > 40: fuera del rango del método HI (resultado aproximado)." if B > 40 else ""
+    return {"B": B, "Cq": cq, "Ce": ce, "aplica": True, "aviso": aviso}
+
+
+# -------------------------------------------------------------------------- curvas a una velocidad
+def curva_tipo(tipo, rpm=None, viscosidad_cst=0.0, sg=1.0, corregir_viscosidad=True, n=160):
+    """Curva de UNA bomba del tipo a la velocidad 'rpm' (leyes de afinidad) y con la corrección por
+    viscosidad (HI). Devuelve dict con arrays q, h, eta (%), p (HP al freno con la SG del producto),
+    bep_q, y los factores de viscosidad."""
+    cab = np.array(tipo["cabeza"], dtype=float)
+    if len(cab) < 2:
+        raise ValueError(f"El tipo de bomba '{tipo['nombre']}' no tiene curva de cabeza.")
+    n0 = float(tipo.get("rpm_nominal") or 1.0)
+    rpm = float(rpm or n0)
+    r = rpm / n0
+    q_w = np.linspace(cab[0, 0], cab[-1, 0], n)
+    h_w = np.interp(q_w, cab[:, 0], cab[:, 1])
+    ef = np.array(tipo["eficiencia"], dtype=float) if tipo.get("eficiencia") else None
+    eta_w = np.interp(q_w, ef[:, 0], ef[:, 1], left=np.nan, right=np.nan) if ef is not None and len(ef) >= 2 \
+        else np.full_like(q_w, np.nan)
+    bep = bep_tipo(tipo)
+    h_bep = float(np.interp(bep, cab[:, 0], cab[:, 1])) if bep > 0 else 0.0
+    fv = factores_viscosidad(viscosidad_cst, h_bep, bep, n0, tipo.get("etapas", 1)) if corregir_viscosidad \
+        else {"B": None, "Cq": 1.0, "Ce": 1.0, "aplica": False, "aviso": ""}
+    if fv["aplica"]:
+        ch = 1 - (1 - fv["Cq"]) * np.clip(q_w / bep, 0, None) ** 0.75
+        q_v, h_v, eta_v, bep_v = q_w * fv["Cq"], h_w * ch, eta_w * fv["Ce"], bep * fv["Cq"]
+    else:
+        q_v, h_v, eta_v, bep_v = q_w, h_w, eta_w, bep
+    q, h, bep_r = q_v * r, h_v * r * r, bep_v * r
+    eta = eta_v
+    with np.errstate(invalid="ignore", divide="ignore"):
+        p = q * BPH_A_GPM * h * sg / (3960.0 * eta / 100.0)
+    p = np.where(np.isfinite(p) & (eta > 0.5), p, np.nan)
+    # potencia del fabricante (si se cargó y no hay eficiencia): afinidad P ∝ N³
+    if np.all(np.isnan(p)) and tipo.get("potencia"):
+        pt = np.array(tipo["potencia"], dtype=float)
+        p = np.interp(q / r, pt[:, 0], pt[:, 1], left=np.nan, right=np.nan) * r ** 3
+    return {"q": q, "h": h, "eta": eta, "p": p, "bep_q": bep_r, "rpm": rpm, "visc": fv}
+
+
+def curva_grupo(tipo, cantidad, rpm=None, **kw):
+    """'cantidad' bombas iguales en paralelo: a igual cabeza, el caudal se multiplica."""
+    c = curva_tipo(tipo, rpm, **kw)
+    m = max(int(cantidad or 1), 1)
+    return {**c, "q": c["q"] * m, "p": c["p"] * m, "bep_q": c["bep_q"] * m, "cantidad": m, "q_bomba": c["q"]}
+
+
+def velocidades(est, factor=1.0):
+    """RPM de cada grupo: los de velocidad variable a factor × su velocidad nominal; fijos a la nominal."""
+    rpms = []
+    for g in est["grupos"]:
+        t = est["tipos"][g["tipo"]]
+        if t.get("velocidad", "variable") == "variable":
+            rpms.append(float(t["rpm_nominal"]) * factor)
+        else:
+            rpms.append(float(t["rpm_nominal"]))
+    return rpms
+
+
+def curva_estacion(est, rpms=None, viscosidad_cst=0.0, sg=1.0, n=240):
+    """Curva de la estación: grupos en serie (las cabezas se suman al mismo caudal). Devuelve
+    (q, h_total, grupos) en el rango de caudal común a todos los grupos."""
+    if not est.get("grupos"):
+        raise ValueError("La estación no tiene bombas configuradas.")
+    rpms = rpms or velocidades(est)
+    corr = est.get("viscosidad_correccion", True)
+    grupos = [curva_grupo(est["tipos"][g["tipo"]], g["cantidad"], rpm, viscosidad_cst=viscosidad_cst, sg=sg,
+                          corregir_viscosidad=corr) for g, rpm in zip(est["grupos"], rpms)]
+    q_max = min(g["q"][-1] for g in grupos)
+    q_min = max(g["q"][0] for g in grupos)
+    q = np.linspace(max(q_min, 0.0), q_max, n)
+    h = sum(np.interp(q, g["q"], g["h"]) for g in grupos)
+    return q, h, grupos
+
+
+def detalle_en_caudal(est, Q, rpms=None, viscosidad_cst=0.0, sg=1.0):
+    """Estado de cada grupo/bomba a un caudal de estación Q: caudal por bomba, cabeza, eficiencia,
+    %BEP, potencia y si está dentro de la ventana 70-120 % BEP."""
+    q, h, grupos = curva_estacion(est, rpms, viscosidad_cst, sg)
+    filas = []
+    for g, cfg, gr in zip(est["grupos"], est["grupos"], grupos):
+        t = est["tipos"][cfg["tipo"]]
+        hq = float(np.interp(Q, gr["q"], gr["h"], left=np.nan, right=np.nan))
+        eta = float(np.interp(Q, gr["q"], gr["eta"], left=np.nan, right=np.nan))
+        p = float(np.interp(Q, gr["q"], gr["p"], left=np.nan, right=np.nan))
+        q_b = Q / gr["cantidad"]
+        pct = 100.0 * Q / gr["bep_q"] if gr["bep_q"] else float("nan")
+        filas.append({"grupo": t["nombre"], "cantidad": gr["cantidad"], "rpm": gr["rpm"], "q_bomba": q_b,
+                      "h": hq, "eta": eta, "pct_bep": pct, "p_total": p, "p_bomba": p / gr["cantidad"],
+                      "en_ventana": VENTANA_BEP[0] * 100 <= pct <= VENTANA_BEP[1] * 100 if np.isfinite(pct) else False,
+                      "fuera_curva": not np.isfinite(hq), "B": gr["visc"]["B"], "Cq": gr["visc"]["Cq"],
+                      "Ce": gr["visc"]["Ce"], "aviso_visc": gr["visc"]["aviso"]})
+    return filas
+
+
+def _cruces(q, f):
+    """Raíces de f (definida en la malla q) por cambio de signo, con interpolación lineal."""
+    raices = []
+    for i in range(len(q) - 1):
+        a, b = f[i], f[i + 1]
+        if not (np.isfinite(a) and np.isfinite(b)):
+            continue
+        if a == 0:
+            raices.append(q[i])
+        elif a * b < 0:
+            raices.append(q[i] - a * (q[i + 1] - q[i]) / (b - a))
+    if len(f) and np.isfinite(f[-1]) and f[-1] == 0:
+        raices.append(q[-1])
+    return raices
+
+
+def punto_operacion(est, q_sis, h_sis, rpms=None, viscosidad_cst=0.0, sg=1.0):
+    """Intersección de la curva de la estación (cabeza diferencial) con la curva requerida del sistema
+    (cabeza diferencial = descarga requerida − succión, en ft). Si hay varias (curva con joroba), se toma
+    la de mayor caudal (rama estable). Devuelve dict o None."""
+    q, h, _ = curva_estacion(est, rpms, viscosidad_cst, sg)
+    hs = np.interp(q, q_sis, h_sis, left=np.nan, right=np.nan)
+    raices = _cruces(q, h - hs)
+    if not raices:
+        return None
+    Q = max(raices)
+    return {"q": Q, "h": float(np.interp(Q, q, h)), "todas": raices}
+
+
+def velocidad_para_punto(est, Q, H_req, viscosidad_cst=0.0, sg=1.0, f_min=0.3, f_max=1.3):
+    """Factor de velocidad común (N/N_nominal de los grupos de velocidad variable) con el que la estación
+    da la cabeza H_req al caudal Q. Devuelve (factor, rpms) o (None, motivo)."""
+    if not any(est["tipos"][g["tipo"]].get("velocidad", "variable") == "variable" for g in est["grupos"]):
+        return None, "No hay bombas de velocidad variable."
+
+    def g(f):
+        q, h, _ = curva_estacion(est, velocidades(est, f), viscosidad_cst, sg)
+        v = float(np.interp(Q, q, h, left=np.nan, right=np.nan))
+        return v - H_req
+    a, b = f_min, f_max
+    ga, gb = g(a), g(b)
+    k = 0
+    while not np.isfinite(ga) and k < 30:      # a baja velocidad el caudal puede quedar fuera de la curva
+        a += (b - a) / 20
+        ga = g(a)
+        k += 1
+    if not (np.isfinite(ga) and np.isfinite(gb)):
+        return None, "El caudal está fuera del rango de las curvas."
+    if ga > 0:
+        return None, "Incluso a la velocidad mínima la estación da más cabeza (habría que estrangular)."
+    if gb < 0:
+        return None, "Ni a la velocidad máxima la estación alcanza esa cabeza."
+    for _ in range(60):
+        c = (a + b) / 2
+        gc = g(c)
+        if not np.isfinite(gc):
+            a = c
+            continue
+        if gc > 0:
+            b = c
+        else:
+            a = c
+    f = (a + b) / 2
+    return f, velocidades(est, f)
+
+
+def limites_velocidad(est):
+    """Factores mínimo y máximo de velocidad de los grupos variables (según rpm_min/rpm_max de cada tipo)."""
+    fmin, fmax = [], []
+    for g in est["grupos"]:
+        t = est["tipos"][g["tipo"]]
+        if t.get("velocidad", "variable") != "variable":
+            continue
+        n0 = float(t["rpm_nominal"])
+        fmin.append((t.get("rpm_min") or 0.5 * n0) / n0)
+        fmax.append((t.get("rpm_max") or n0) / n0)
+    return (max(fmin), min(fmax)) if fmin else (1.0, 1.0)
+
+
+def ventana_operativa(est, viscosidad_cst=0.0, sg=1.0, pasos=25):
+    """Ventana operativa de la estación: entre la velocidad mínima y máxima, y entre 70 % y 120 % del BEP
+    de TODAS las bombas (el más restrictivo). Devuelve polígono (lista de (q, h)) y los bordes."""
+    fmin, fmax = limites_velocidad(est)
+    bordes_bajo, bordes_alto, curvas = [], [], {}
+    for f in np.linspace(fmin, fmax, pasos):
+        q, h, grupos = curva_estacion(est, velocidades(est, f), viscosidad_cst, sg)
+        q_lo = max(VENTANA_BEP[0] * g["bep_q"] for g in grupos)
+        q_hi = min(VENTANA_BEP[1] * g["bep_q"] for g in grupos)
+        q_lo, q_hi = max(q_lo, q[0]), min(q_hi, q[-1])
+        if q_lo >= q_hi:
+            continue
+        bordes_bajo.append((q_lo, float(np.interp(q_lo, q, h))))
+        bordes_alto.append((q_hi, float(np.interp(q_hi, q, h))))
+        curvas[round(f, 6)] = (q, h)
+    if not bordes_bajo:
+        return None
+    f_lo, f_hi = min(curvas), max(curvas)
+    qa, ha = curvas[f_hi]
+    sup = [(x, y) for x, y in zip(qa, ha) if bordes_bajo[-1][0] <= x <= bordes_alto[-1][0]]
+    qb, hb = curvas[f_lo]
+    inf = [(x, y) for x, y in zip(qb, hb) if bordes_bajo[0][0] <= x <= bordes_alto[0][0]]
+    poligono = bordes_bajo + [bordes_bajo[-1]] + sup + [bordes_alto[-1]] + bordes_alto[::-1] + inf[::-1]
+    return {"poligono": poligono, "bajo": bordes_bajo, "alto": bordes_alto, "f_min": f_lo, "f_max": f_hi}
+
+
+def dentro_poligono(x, y, poligono):
+    """Prueba punto en polígono (vectorizada, ray casting)."""
+    px = np.array([p[0] for p in poligono])
+    py = np.array([p[1] for p in poligono])
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    dentro = np.zeros(x.shape, dtype=bool)
+    j = len(px) - 1
+    for i in range(len(px)):
+        cond = ((py[i] > y) != (py[j] > y))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            xint = (px[j] - px[i]) * (y - py[i]) / (py[j] - py[i]) + px[i]
+        dentro ^= cond & (x < xint)
+        j = i
+    return dentro
+
+
+# -------------------------------------------------------------------------- curva requerida del simulador
+def curva_requerida_simulador(proy, res, cadena, indice, q_min_bph, q_max_bph, pasos=30, p_succion_psig=None,
+                              dr_forzado=None):
+    """Curva del sistema que ve la estación (cadena, indice) según el simulador: presión de descarga
+    requerida vs caudal hasta la siguiente estación que fija su recibo; se resta la presión de succión
+    (recibo de la estación en el simulador, u otra dada) y se pasa a cabeza diferencial en ft.
+    Devuelve dict con q (BPH), h_dif (ft), p_desc (psig), p_succion, sg, q_operacion (BPH)."""
+    cad = cadena_de(proy, cadena)
+    if cad is None or indice >= len(cad.tramos):
+        raise ValueError("La estación elegida no tiene tramo aguas abajo.")
+    fin = estacion_control(cad, indice)
+    sg = gravedad_especifica(proy.densidad)
+    rs = list(res) if not cadena else list((getattr(res, "red", None) or {}).get(cadena, {}).get("res", []))
+    if p_succion_psig is None:
+        if indice > 0 and indice - 1 < len(rs):
+            p_succion_psig = rs[indice - 1].presion_recibo
+        else:
+            p_succion_psig = 0.0
+    filas, _ = curva_entre_estaciones(proy, cadena, indice, fin, q_min_bph * BPH_A_KBD, q_max_bph * BPH_A_KBD,
+                                      pasos, dr_forzado, None, False)
+    q = np.array([f[0] / BPH_A_KBD for f in filas])
+    p = np.array([f[1][0] for f in filas])
+    q_op = rs[indice].flujo_kbd / BPH_A_KBD if indice < len(rs) else None
+    p_op = rs[indice].presion_descarga if indice < len(rs) else None
+    if q_op and q_min_bph < q_op < q_max_bph:          # el caudal de operación como punto exacto de la malla
+        f_op, _ = curva_entre_estaciones(proy, cadena, indice, fin, q_op * BPH_A_KBD, q_op * BPH_A_KBD, 1,
+                                         dr_forzado, None, False)
+        k = int(np.searchsorted(q, q_op))
+        q = np.insert(q, k, q_op)
+        p = np.insert(p, k, f_op[0][1][0])
+    return {"q": q, "p_desc": p, "h_dif": psi_a_pies(p - p_succion_psig, sg), "h_desc": psi_a_pies(p, sg),
+            "p_succion": p_succion_psig, "sg": sg, "q_operacion": q_op, "p_desc_operacion": p_op,
+            "estacion_fin": cad.estaciones[fin].nombre}
+
+
+def analizar_estacion(proy, res, cadena, indice, est, q_max_bph=None, factor=None):
+    """Análisis completo de la estación con la curva del simulador: punto de operación a las velocidades
+    nominales (o a 'factor'), RPM necesarias para el caudal actual del simulador y estado de cada bomba."""
+    sg = gravedad_especifica(proy.densidad)
+    visc = proy.viscosidad if est.get("viscosidad_correccion", True) else 0.0
+    q_b, h_b, _ = curva_estacion(est, velocidades(est, factor or limites_velocidad(est)[1]), visc, sg)
+    q_max_bph = q_max_bph or float(q_b[-1])
+    psuc = None if est.get("succion_modo", "simulador") == "simulador" else float(est.get("p_succion_psig", 0.0))
+    req = curva_requerida_simulador(proy, res, cadena, indice, 0.0, q_max_bph, 30, psuc)
+    rpms = velocidades(est, factor) if factor else None
+    po = punto_operacion(est, req["q"], req["h_dif"], rpms, visc, sg)
+    salida = {"requerida": req, "sg": sg, "viscosidad": visc, "punto": po, "rpms": rpms or velocidades(est)}
+    if po:
+        salida["detalle_punto"] = detalle_en_caudal(est, po["q"], rpms, visc, sg)
+    q_op = req["q_operacion"]
+    if q_op:
+        h_req = float(np.interp(q_op, req["q"], req["h_dif"]))
+        f, extra = velocidad_para_punto(est, q_op, h_req, visc, sg)
+        salida["q_operacion"] = q_op
+        salida["h_req_operacion"] = h_req
+        if f is not None:
+            salida["factor_operacion"] = f
+            salida["rpms_operacion"] = extra
+            salida["detalle_operacion"] = detalle_en_caudal(est, q_op, extra, visc, sg)
+            fmin, fmax = limites_velocidad(est)
+            salida["aviso_velocidad"] = "" if fmin - 1e-9 <= f <= fmax + 1e-9 else (
+                f"La velocidad necesaria ({100 * f:.1f} % de la nominal) está fuera del rango "
+                f"{100 * fmin:.0f}–{100 * fmax:.0f} % configurado.")
+        else:
+            salida["motivo_operacion"] = extra
     return salida
 
 # --------------------------------------------------------------------------
@@ -2447,6 +2994,9 @@ class BaseDatos:
         c.execute("CREATE TABLE IF NOT EXISTS productos (orden INTEGER, nombre TEXT PRIMARY KEY, densidad REAL, "
                   "visc1 REAL, t1 REAL, dens2 REAL, visc2 REAL, t2 REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS config (clave TEXT PRIMARY KEY, valor TEXT)")
+        # estaciones de bombeo: módulo aparte (no modifica los datos ni el historial de los sistemas)
+        c.execute("CREATE TABLE IF NOT EXISTS bombas (sistema TEXT, estacion TEXT, datos TEXT NOT NULL, "
+                  "actualizado TEXT, usuario TEXT, PRIMARY KEY (sistema, estacion))")
         c.commit()
         if not self.productos():
             self.guardar_productos(PRODUCTOS_DEFECTO)
@@ -2500,6 +3050,7 @@ class BaseDatos:
 
     def renombrar(self, viejo, nuevo):
         self.con.execute("UPDATE sistemas SET nombre=? WHERE nombre=?", (nuevo, viejo))
+        self.con.execute("UPDATE bombas SET sistema=? WHERE sistema=?", (nuevo, viejo))
         self.con.execute("UPDATE historial SET sistema=? WHERE sistema=?", (nuevo, viejo))
         self.con.commit()
 
@@ -2518,6 +3069,26 @@ class BaseDatos:
                              [(k, *(list(p) + [None] * 7)[:7]) for k, p in enumerate(productos)])
         if commit:
             self.con.commit()
+
+    # ---------------- estaciones de bombeo (módulo aparte)
+    def bombas_de(self, sistema):
+        """{clave de estación: datos} de las estaciones de bombeo configuradas en un sistema."""
+        return {e: json.loads(d) for e, d in self.con.execute(
+            "SELECT estacion, datos FROM bombas WHERE sistema=?", (sistema,))}
+
+    def guardar_bombas(self, sistema, estacion, datos, usuario=None):
+        self.con.execute("INSERT OR REPLACE INTO bombas VALUES (?,?,?,?,?)",
+                         (sistema, estacion, json.dumps(datos, ensure_ascii=False),
+                          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), usuario or usuario_actual()))
+        self.con.commit()
+
+    def eliminar_bombas(self, sistema, estacion):
+        self.con.execute("DELETE FROM bombas WHERE sistema=? AND estacion=?", (sistema, estacion))
+        self.con.commit()
+
+    def info_bombas(self, sistema, estacion):
+        return self.con.execute("SELECT actualizado, usuario FROM bombas WHERE sistema=? AND estacion=?",
+                                (sistema, estacion)).fetchone()
 
     # ---------------- configuración
     def config(self, clave, defecto=None):
